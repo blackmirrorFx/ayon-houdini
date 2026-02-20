@@ -28,6 +28,181 @@ _LOGGER.setLevel(logging.INFO)
 
 _FROZEN_WRITE_VERSION = None
 
+_DEADLINE_MACHINE_LIST_PARM = "machine_list"
+_DEADLINE_MACHINE_DENYLIST_PARM = "machine_list_is_deny"
+
+
+def _normalized_machine_list(raw_value):
+    if raw_value is None:
+        return ""
+    tokens = [part.strip() for part in re.split(r"[,\s;]+", str(raw_value)) if part.strip()]
+    if not tokens:
+        return ""
+    deduped = list(dict.fromkeys(tokens))
+    return ",".join(deduped)
+
+
+def _parse_deadline_machine_names(raw_output):
+    names = []
+    for part in re.split(r"[\r\n,]+", raw_output or ""):
+        value = part.strip()
+        if not value:
+            continue
+        lowered = value.lower()
+        if lowered.startswith(("result", "success", "error", "warning", "info")):
+            continue
+        if "=" in value:
+            prefix = value.split("=", 1)[0].strip().lower()
+            if prefix in {"result", "success", "error", "warning", "info"}:
+                continue
+        names.append(value)
+    return list(dict.fromkeys(names))
+
+
+def _query_deadline_machine_names():
+    for command in ("-GetWorkerNames", "-GetSlaveNames"):
+        try:
+            output = subprocess.check_output(
+                ["deadlinecommand", command],
+                stderr=subprocess.STDOUT,
+            ).decode()
+        except (subprocess.CalledProcessError, OSError):
+            continue
+        names = _parse_deadline_machine_names(output)
+        if names:
+            return names
+    return []
+
+
+def pick_deadline_machine_list(kwargs):
+    node = None
+    if isinstance(kwargs, dict):
+        node = kwargs.get("node")
+    elif isinstance(kwargs, hou.Node):
+        node = kwargs
+    if not node:
+        return
+
+    ensure_deadline_machine_list_parms(node)
+    machine_list_parm = node.parm(_DEADLINE_MACHINE_LIST_PARM)
+    if machine_list_parm is None:
+        return
+
+    machine_names = _query_deadline_machine_names()
+    if not machine_names:
+        hou.ui.displayMessage(
+            "No Deadline workers found. Check Deadline client connection.",
+            title="Deadline",
+        )
+        return
+
+    selected_now = _normalized_machine_list(machine_list_parm.evalAsString()).split(",")
+    selected_now = [name for name in selected_now if name]
+    selected_set = set(selected_now)
+    default_indices = [
+        index for index, name in enumerate(machine_names) if name in selected_set
+    ]
+
+    picked = hou.ui.selectFromList(
+        machine_names,
+        default_choices=default_indices,
+        exclusive=False,
+        title="Select Deadline Machines",
+        message="Choose machines for the Deadline machine list.",
+        clear_on_cancel=False,
+    )
+    if picked is None:
+        return
+
+    selected = [machine_names[index] for index in picked]
+    machine_list_parm.set(",".join(selected))
+
+
+def ensure_deadline_machine_list_parms(node):
+    if (
+        node.parm(_DEADLINE_MACHINE_LIST_PARM)
+        and node.parm(_DEADLINE_MACHINE_DENYLIST_PARM)
+    ):
+        return
+
+    try:
+        group = node.parmTemplateGroup()
+    except (hou.PermissionError, hou.OperationFailed):
+        return
+
+    changed = False
+
+    if not group.find(_DEADLINE_MACHINE_DENYLIST_PARM):
+        deny_template = hou.ToggleParmTemplate(
+            _DEADLINE_MACHINE_DENYLIST_PARM,
+            "Machine List Is Deny List",
+            default_value=False,
+        )
+        try:
+            if group.find("single_machine"):
+                group.insertAfter("single_machine", deny_template)
+            else:
+                group.append(deny_template)
+        except hou.OperationFailed:
+            group.append(deny_template)
+        changed = True
+
+    if not group.find(_DEADLINE_MACHINE_LIST_PARM):
+        list_template = hou.StringParmTemplate(
+            _DEADLINE_MACHINE_LIST_PARM,
+            "Machine List",
+            1,
+            default_value=("",),
+        )
+        list_template.setHelp(
+            "Comma-separated Deadline worker names used for whitelist or deny list."
+        )
+        list_template.setTags({
+            "script_action": (
+                "import importlib, ayon_houdini.nodes.lops.filecache as fc; "
+                "fc = importlib.reload(fc); "
+                "fc.pick_deadline_machine_list(kwargs)"
+            ),
+            "script_action_icon": "BUTTONS_gear",
+            "script_action_help": "Select Deadline machines",
+            "script_action_language": "python",
+        })
+        # Pick a sensible anchor inside the "Farm Settings" area so the
+        # Machine List appears near other farm-related params. Try several
+        # common parameter names and fall back to appending if nothing
+        # matches.
+        anchor_parm = None
+        if group.find(_DEADLINE_MACHINE_DENYLIST_PARM):
+            anchor_parm = _DEADLINE_MACHINE_DENYLIST_PARM
+        else:
+            for cand in (
+                "single_machine",
+                "chunks",
+                "priority",
+                "machine_limit",
+                "cache_path",
+                "cachepath",
+                "cache",
+            ):
+                if group.find(cand):
+                    anchor_parm = cand
+                    break
+
+        try:
+            if anchor_parm:
+                group.insertAfter(anchor_parm, list_template)
+            else:
+                group.append(list_template)
+        except hou.OperationFailed:
+            group.append(list_template)
+        changed = True
+
+    if changed:
+        try:
+            node.setParmTemplateGroup(group)
+        except (hou.PermissionError, hou.OperationFailed):
+            return
+
 def get_ayon_launcher_env():
     return {
         k: v for k, v in os.environ.items()
@@ -99,9 +274,6 @@ def save_ayon_context_for_node(node, version):
     }
     with open(path, "w") as f:
         json.dump(data, f, indent=4)
-
-    print("[AYON] Context JSON saved")
-    print(f"       {path}")
 
 def project_root():
     """Resolves the $JOB root with fallbacks."""
@@ -270,15 +442,20 @@ def resolve_f2(node):
 
 
 def save_hip_to_version_dir(node, version):
-    original_path = hou.hipFile.path()
-    if not original_path or original_path == "untitled.hip":
-        raise RuntimeError("Please save the HIP file before caching.")
     version_path = version_dir(node, version, create=True)
     hip_dir = os.path.join(version_path, "hip")
     os.makedirs(hip_dir, exist_ok=True)
     dst = os.path.join(hip_dir, "source.hip")
-    hou.hipFile.save(file_name=dst)
-    hou.hipFile.setName(original_path)
+
+    # Save current in-memory scene directly to snapshot HIP
+    # without renaming/saving the artist's main scene file.
+    try:
+        hscript_dst = dst.replace("\\", "/").replace('"', '\\"')
+        hou.hscript(f'mwrite -n "{hscript_dst}"')
+    except hou.OperationFailed as exc:
+        raise RuntimeError(
+            f"Failed to save snapshot HIP to {dst}: {exc}"
+        ) from exc
     return dst
 
 def get_path_for_ui(node):
@@ -522,6 +699,7 @@ def missing_frames_in_range(node, version):
     return missing
 
 def set_status(node, state):
+    ensure_deadline_machine_list_parms(node)
     COLORS = {
         "LIVE":          (0.3, 0.3, 0.3),
         "CACHED":        (0.1, 0.6, 0.1),
@@ -547,19 +725,20 @@ def _build_default_batch_name(node, version):
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     return f"{hip_name} | {node.name()} | v{int(version):03d} | {timestamp}"
 
-def submit_cache_to_deadline(node, dependent_job_id=None, batch_name=None):
+def submit_cache_to_deadline(
+    node,
+    dependent_job_id=None,
+    batch_name=None,
+    machine_limit=None,
+    machine_list=None,
+    machine_list_is_deny=None,
+):
     """
     Submit this FileCache node to Deadline.
     Supports Batch grouping and Job dependencies.
     """
     version = active_version(node)
-    _LOGGER.info("=" * 60)
-    _LOGGER.info(
-        "DEADLINE SUBMIT | Node: %s | Version: v%03d",
-        node.path(),
-        version,
-    )
-
+    ensure_deadline_machine_list_parms(node)
     save_ayon_context_for_node(node, version)
     json_path = ayon_context_json_path(node, version)
     hip_path = save_hip_to_version_dir(node, version)
@@ -577,19 +756,26 @@ def submit_cache_to_deadline(node, dependent_job_id=None, batch_name=None):
     if not batch_name:
         batch_name = _build_default_batch_name(node, version)
 
-    _LOGGER.info("BatchName: %s", batch_name)
-    if dependent_job_id:
-        _LOGGER.info("Dependency JobID: %s", dependent_job_id)
-    _LOGGER.info(
-        "Frames: %s-%s | ChunkSize: %s | Pool: houdini | Priority: %s | SingleMachine: %s",
-        f1,
-        f2,
-        chunk_size,
-        user_priority,
-        single_machine,
-    )
-    _LOGGER.info("Context JSON: %s", json_path)
-    _LOGGER.info("HIP saved: %s", hip_path)
+    if machine_limit is None and node.parm("machine_limit"):
+        machine_limit = node.parm("machine_limit").eval()
+
+    normalized_machine_limit = None
+    if machine_limit is not None:
+        try:
+            normalized_machine_limit = int(machine_limit)
+        except (TypeError, ValueError):
+            normalized_machine_limit = None
+        if normalized_machine_limit is not None and normalized_machine_limit < 1:
+            normalized_machine_limit = None
+
+    if machine_list is None:
+        machine_list_parm = node.parm(_DEADLINE_MACHINE_LIST_PARM)
+        machine_list = machine_list_parm.evalAsString() if machine_list_parm else ""
+    normalized_machine_list = _normalized_machine_list(machine_list)
+
+    if machine_list_is_deny is None:
+        denylist_parm = node.parm(_DEADLINE_MACHINE_DENYLIST_PARM)
+        machine_list_is_deny = bool(denylist_parm.eval()) if denylist_parm else False
 
     # --- JOB INFO ---
     job_info = {
@@ -606,10 +792,14 @@ def submit_cache_to_deadline(node, dependent_job_id=None, batch_name=None):
 
     if dependent_job_id:
         job_info["JobDependency0"] = dependent_job_id
+    if normalized_machine_limit:
+        job_info["MachineLimit"] = normalized_machine_limit
+    if normalized_machine_list:
+        key = "Blacklist" if machine_list_is_deny else "Whitelist"
+        job_info[key] = normalized_machine_list
 
     # --- PLUGIN INFO ---
     rop = get_active_rop(node)
-    _LOGGER.info("OutputDriver: %s", rop.path())
     plugin_info = {
         "SceneFile": hip_path,
         "OutputDriver": rop.path(),
@@ -642,7 +832,6 @@ def submit_cache_to_deadline(node, dependent_job_id=None, batch_name=None):
             new_job_id = match.group(1)
             node.parm("version").set(str(version))
             update_cache_status(node)
-            _LOGGER.info("DEADLINE SUCCESS | JobID: %s", new_job_id)
             return new_job_id 
 
         _LOGGER.error(
@@ -661,7 +850,17 @@ def submit_cache_to_deadline(node, dependent_job_id=None, batch_name=None):
         for f in [job_file.name, plugin_file.name]:
             if os.path.exists(f): os.remove(f)
 
+
+def on_node_created(node):
+    """
+    Initialize the LOP FileCache node with Deadline machine list parameters.
+    Call this from the node's OnCreated callback.
+    """
+    ensure_deadline_machine_list_parms(node)
+
+
 def update_cache_status(node):
+    ensure_deadline_machine_list_parms(node)
     node.setGenericFlag(hou.nodeFlag.DisplayComment, False)
     versions = existing_versions(node)
     mode_parm = node.parm("mode")
