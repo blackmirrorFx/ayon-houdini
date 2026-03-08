@@ -50,6 +50,10 @@ def rebuild_menu(parm):
         return parm.menuItems()
     except hou.OperationFailed:
         return []
+    # ---------------------------------------------------------
+    # IMPORT ASSET LAYER (LATER)
+    # ---------------------------------------------------------
+
 
 
 def _set_first_menu_item(parm):
@@ -89,6 +93,8 @@ def sync_version_to_latest(node):
     """Set `version` parm to latest available token for current selection."""
     version_parm = node.parm("version")
     if not version_parm:
+
+
         return None
 
     token = get_latest_version_token(node)
@@ -136,6 +142,50 @@ def run_import(node):
         print(f"[AYON] Import triggered for asset: {asset_name}")
     except Exception as exc:
         print(f"[AYON] Build Error: {exc}")
+
+
+def import_usd_sublayer(node):
+    """Set the inner sublayer filepath from the selected asset version."""
+    category = node.evalParm("category") if node.parm("category") else ""
+    asset = node.evalParm("asset") if node.parm("asset") else ""
+    task = node.evalParm("department") if node.parm("department") else ""
+    version_str = (
+        node.evalParm("version")
+        if node.parm("version")
+        else node.evalParm("resolved_version")
+        if node.parm("resolved_version")
+        else ""
+    )
+
+    if not version_str:
+        hou.ui.displayMessage("Version is empty")
+        return
+
+    try:
+        version = int(str(version_str).replace("v", ""))
+    except ValueError:
+        hou.ui.displayMessage(f"Invalid version: {version_str}")
+        return
+
+    asset_module = _get_asset_module()
+    data = asset_module.get_usd_for_asset_version(
+        category,
+        asset,
+        task,
+        version,
+    )
+
+    if not data:
+        hou.ui.displayMessage("USD not found for selected version")
+        return
+
+    sublayer = node.node("sublayer")
+    if not sublayer:
+        hou.ui.displayMessage("SubLayer node not found inside HDA")
+        return
+
+    sublayer.parm("filepath1").set(data["usd_path"])
+    sublayer.cook(force=True)
 
 
 # ---------------------------------------------------------
@@ -709,6 +759,16 @@ def cb_import_asset_layer_department(node):
     on_department_changed(node)
 
 
+def cb_import_asset_layer_import(node):
+    """Callback for import_asset_layer import button."""
+    import_usd_sublayer(node)
+
+
+def cb_import_asset_sop(node):
+    """Callback for SOP button that creates import_asset in lopnet."""
+    on_created_import_asset_sop(node)
+
+
 # ---------------------------------------------------------
 # ON CREATED HELPERS
 # ---------------------------------------------------------
@@ -751,3 +811,55 @@ def on_created_import_asset_batch(node_or_kwargs):
     asset_module = _get_asset_module(reload_module=True)
     _sync_all_batch_assets(node, asset_module)
     node.cook(force=True)
+
+
+def on_created_import_asset_sop(node_or_kwargs):
+    """OnCreated helper for SOP subnet that hosts a LOP import_asset."""
+    node = _node_from_arg(node_or_kwargs)
+    if not node:
+        return
+
+    lopnet = None
+    for child in node.children():
+        if child.type().name() == "lopnet":
+            lopnet = child
+            break
+
+    if not lopnet:
+        return
+
+    for existing_node in list(lopnet.children()):
+        try:
+            existing_node.destroy()
+        except Exception:
+            pass
+
+    layer_node = lopnet.createNode("import_asset")
+
+    if node.parm("category") and layer_node.parm("category"):
+        layer_node.parm("category").set(node.evalParm("category"))
+    if node.parm("asset") and layer_node.parm("asset"):
+        layer_node.parm("asset").set(node.evalParm("asset"))
+    if node.parm("department") and layer_node.parm("department"):
+        layer_node.parm("department").set(node.evalParm("department"))
+
+    asset_module = _get_asset_module(reload_module=True)
+    _sync_single_asset_from_category(layer_node, asset_module)
+    _sync_layer_department_and_version(layer_node, asset_module)
+
+    try:
+        cb_import_asset_import(layer_node)
+    except Exception:
+        pass
+
+    output_node = None
+    for child in lopnet.children():
+        if child.type().name() == "output":
+            output_node = child
+            break
+    if not output_node:
+        output_node = lopnet.createNode("output", "OUT")
+    output_node.setInput(0, layer_node)
+
+    layer_node.cook(force=True)
+    lopnet.layoutChildren()
