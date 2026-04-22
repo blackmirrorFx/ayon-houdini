@@ -7,6 +7,7 @@ from ayon_core.pipeline import get_current_context
 import json
 import tempfile
 import subprocess
+import shutil
 from pxr import Usd
 
 # --------------------------------------------------
@@ -725,6 +726,264 @@ def _build_default_batch_name(node, version):
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     return f"{hip_name} | {node.name()} | v{int(version):03d} | {timestamp}"
 
+
+def _write_deadline_info_file(data, suffix):
+    info_file = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+    with open(info_file.name, "wb") as stream:
+        for key, value in data.items():
+            stream.write(f"{key}={value}\n".encode())
+    return info_file.name
+
+
+def _submit_deadline_files(job_info, plugin_info):
+    job_file = _write_deadline_info_file(job_info, "_job.info")
+    plugin_file = _write_deadline_info_file(plugin_info, "_plugin.info")
+
+    try:
+        result = subprocess.check_output(
+            ["deadlinecommand", job_file, plugin_file],
+            stderr=subprocess.STDOUT,
+        ).decode()
+        _LOGGER.debug("Deadline output:\n%s", result.strip())
+
+        match = re.search(r"JobID=([\w\d]+)", result)
+        if match:
+            return match.group(1)
+
+        _LOGGER.error(
+            "DEADLINE ERROR | Job submitted but JobID not found in output:\n%s",
+            result.strip(),
+        )
+        return None
+
+    except subprocess.CalledProcessError as exc:
+        _LOGGER.error(
+            "DEADLINE ERROR | Submission failed:\n%s",
+            exc.output.decode().strip(),
+        )
+        return None
+    finally:
+        for path in (job_file, plugin_file):
+            if os.path.exists(path):
+                os.remove(path)
+
+
+def _resolve_hython_executable():
+    exe_name = "hython.exe" if os.name == "nt" else "hython"
+
+    hfs = hou.getenv("HFS") or os.environ.get("HFS")
+    if hfs:
+        return os.path.join(hfs, "bin", exe_name)
+
+    found = shutil.which(exe_name)
+    if found:
+        return found
+
+    try:
+        major, minor = hou.applicationVersion()[:2]
+        if os.name != "nt":
+            return f"/opt/hfs{major}.{minor}/bin/hython"
+    except Exception:
+        pass
+
+    return exe_name
+
+
+def _master_wrapper_job_script_source(ver_dir, f1, f2):
+    ver_dir_literal = json.dumps(ver_dir.replace("\\", "/"))
+    return f'''import os
+import re
+import sys
+from pxr import Usd
+
+VER_DIR = {ver_dir_literal}
+F1 = {int(f1)}
+F2 = {int(f2)}
+MAIN_PATH = os.path.join(VER_DIR, "master.usdc").replace("\\\\", "/")
+
+
+def _log(message):
+    print("[BMFX USD Wrapper] " + message, flush=True)
+
+
+def _pick_clip_files():
+    seq_rx = re.compile(r"^(sequence|main)\\.(\\d+)\\.(usd|usdc|usda)$")
+    single_rx = re.compile(r"^(sequence|main)\\.(usd|usdc|usda)$")
+    seq_candidates = []
+    single_candidates = []
+
+    for name in os.listdir(VER_DIR):
+        seq_match = seq_rx.match(name)
+        if seq_match:
+            base, frame_str, ext = seq_match.groups()
+            preference = 0 if base == "sequence" else 1
+            seq_candidates.append(
+                (preference, int(frame_str), frame_str, base, ext, name)
+            )
+            continue
+
+        single_match = single_rx.match(name)
+        if single_match:
+            base, ext = single_match.groups()
+            preference = 0 if base == "sequence" else 1
+            single_candidates.append((preference, base, ext, name))
+
+    if seq_candidates:
+        seq_candidates.sort(key=lambda item: (item[0], item[1]))
+        return True, seq_candidates[0]
+
+    if single_candidates:
+        single_candidates.sort(key=lambda item: item[0])
+        return False, single_candidates[0]
+
+    raise RuntimeError(
+        "No clip files found in {{}} (expected sequence.*.<usd/usdc/usda>)".format(
+            VER_DIR
+        )
+    )
+
+
+def _clip_root(first_clip_name):
+    first_clip_path = os.path.join(VER_DIR, first_clip_name).replace("\\\\", "/")
+    clip_stage = Usd.Stage.Open(first_clip_path)
+    if not clip_stage:
+        raise RuntimeError("Could not open first clip file: " + first_clip_path)
+
+    default_prim = clip_stage.GetDefaultPrim()
+    if default_prim and default_prim.IsValid():
+        return (
+            default_prim.GetPath().pathString,
+            default_prim.GetTypeName() or "Xform",
+        )
+
+    roots = clip_stage.GetPseudoRoot().GetChildren()
+    if not roots:
+        raise RuntimeError("No root prim found in clip: " + first_clip_path)
+
+    return roots[0].GetPath().pathString, roots[0].GetTypeName() or "Xform"
+
+
+def main():
+    if not os.path.isdir(VER_DIR):
+        raise RuntimeError("Version directory does not exist: " + VER_DIR)
+
+    is_sequence, clip_data = _pick_clip_files()
+    if is_sequence:
+        _, first_frame, first_frame_str, clip_base, clip_ext, first_clip_name = clip_data
+        pad = len(first_frame_str)
+    else:
+        _, clip_base, clip_ext, first_clip_name = clip_data
+        first_frame = F1
+        pad = 1
+
+    root_path, root_type = _clip_root(first_clip_name)
+
+    if os.path.exists(MAIN_PATH):
+        os.remove(MAIN_PATH)
+
+    stage = Usd.Stage.CreateNew(MAIN_PATH)
+    root_prim = stage.DefinePrim(root_path, root_type)
+    stage.SetDefaultPrim(root_prim)
+    stage.SetStartTimeCode(F1)
+    stage.SetEndTimeCode(F2)
+
+    if is_sequence:
+        clips = Usd.ClipsAPI(root_prim)
+        clip_template = "{{}}.{{}}.{{}}".format(clip_base, "#" * pad, clip_ext)
+        clips.SetClipTemplateAssetPath(clip_template)
+        clips.SetClipTemplateStartTime(F1)
+        clips.SetClipTemplateEndTime(F2)
+        clips.SetClipTemplateStride(1.0)
+        clips.SetClipActive([(F1, 0)])
+        clips.SetClipTimes([(F1, F1), (F2, F2)])
+        clips.SetClipPrimPath(root_path)
+        root_prim.GetReferences().AddReference(
+            "./{{}}.{{}}.{{}}".format(clip_base, str(first_frame).zfill(pad), clip_ext),
+            root_path,
+        )
+    else:
+        root_prim.GetReferences().AddReference(
+            "./{{}}.{{}}".format(clip_base, clip_ext),
+            root_path,
+        )
+
+    stage.GetRootLayer().Save()
+    if not os.path.exists(MAIN_PATH):
+        raise RuntimeError("Save completed but master.usdc was not found: " + MAIN_PATH)
+
+    _log("Created " + MAIN_PATH + " | ClipPrim: " + root_path)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as exc:
+        _log("ERROR: " + str(exc))
+        raise
+'''
+
+
+def _write_master_wrapper_job_script(node, version, f1, f2):
+    ver_dir = version_dir(node, version, create=True)
+    script_path = os.path.join(ver_dir, ".create_master_wrapper.py")
+    with open(script_path, "w") as stream:
+        stream.write(_master_wrapper_job_script_source(ver_dir, f1, f2))
+    return script_path
+
+
+def _submit_master_wrapper_job(
+    node,
+    version,
+    f1,
+    f2,
+    batch_name,
+    priority,
+    dependency_job_id,
+    json_path,
+    machine_limit=None,
+    machine_list=None,
+    machine_list_is_deny=False,
+):
+    script_path = _write_master_wrapper_job_script(node, version, f1, f2)
+    hython_path = _resolve_hython_executable()
+
+    job_info = {
+        "Plugin": "CommandLine",
+        "BatchName": batch_name,
+        "Name": f"{node.name()} | v{version:03d} | master.usdc",
+        "Frames": "0",
+        "ChunkSize": 1,
+        "Pool": "houdini",
+        "Priority": priority,
+        "JobDependency0": dependency_job_id,
+        "EnvironmentKeyValue0": f"AYON_CONTEXT_JSON={json_path}",
+        "EnvironmentKeyValue1": f"BMFX_FROZEN_VERSION={version}",
+    }
+
+    if machine_limit:
+        job_info["MachineLimit"] = machine_limit
+    if machine_list:
+        key = "Blacklist" if machine_list_is_deny else "Whitelist"
+        job_info[key] = machine_list
+
+    plugin_info = {
+        "Executable": hython_path,
+        "Arguments": f'"{script_path}"',
+        "StartupDirectory": version_dir(node, version),
+        "ShellExecute": False,
+        "SingleFramesOnly": True,
+    }
+
+    wrapper_job_id = _submit_deadline_files(job_info, plugin_info)
+    if wrapper_job_id:
+        _LOGGER.info(
+            "DEADLINE WRAPPER SUCCESS | Render JobID: %s | Wrapper JobID: %s",
+            dependency_job_id,
+            wrapper_job_id,
+        )
+    return wrapper_job_id
+
+
 def submit_cache_to_deadline(
     node,
     dependent_job_id=None,
@@ -810,45 +1069,27 @@ def submit_cache_to_deadline(
         "EndFrame": f2,
     }
 
-    # Submission logic using subprocess to capture JobID
-    job_file = tempfile.NamedTemporaryFile(delete=False, suffix="_job.info")
-    plugin_file = tempfile.NamedTemporaryFile(delete=False, suffix="_plugin.info")
-
-    try:
-        with open(job_file.name, 'wb') as f:
-            for k, v in job_info.items():
-                f.write(f"{k}={v}\n".encode())
-
-        with open(plugin_file.name, 'wb') as f:
-            for k, v in plugin_info.items():
-                f.write(f"{k}={v}\n".encode())
-
-        cmd = ["deadlinecommand", job_file.name, plugin_file.name]
-        result = subprocess.check_output(cmd, stderr=subprocess.STDOUT).decode()
-        _LOGGER.debug("Deadline output:\n%s", result.strip())
-        
-        match = re.search(r"JobID=([\w\d]+)", result)
-        if match:
-            new_job_id = match.group(1)
-            node.parm("version").set(str(version))
-            update_cache_status(node)
-            return new_job_id 
-
-        _LOGGER.error(
-            "DEADLINE ERROR | Job submitted but JobID not found in output:\n%s",
-            result.strip(),
-        )
+    new_job_id = _submit_deadline_files(job_info, plugin_info)
+    if not new_job_id:
         return None
-            
-    except subprocess.CalledProcessError as e:
-        _LOGGER.error(
-            "DEADLINE ERROR | Submission failed:\n%s",
-            e.output.decode().strip(),
-        )
-        return None
-    finally:
-        for f in [job_file.name, plugin_file.name]:
-            if os.path.exists(f): os.remove(f)
+
+    wrapper_job_id = _submit_master_wrapper_job(
+        node,
+        version,
+        f1,
+        f2,
+        batch_name,
+        user_priority,
+        new_job_id,
+        json_path,
+        machine_limit=normalized_machine_limit,
+        machine_list=normalized_machine_list,
+        machine_list_is_deny=machine_list_is_deny,
+    )
+
+    node.parm("version").set(str(version))
+    update_cache_status(node)
+    return wrapper_job_id or new_job_id
 
 
 def on_node_created(node):

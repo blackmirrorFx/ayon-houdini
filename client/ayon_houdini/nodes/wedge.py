@@ -106,6 +106,7 @@ _READ_ALL_WEDGES_PARMS = (
     "all_wedges",
 )
 _SUBMIT_REVIEW_JOB_PARMS = (
+    "doflipbook",
     "submit_review_job",
     "submit_flipbook_job",
     "submit_wedge_flipbook",

@@ -1,15 +1,17 @@
 """
-LOPs MaterialX builder for Solaris.
+LOPs material builder for Solaris.
 
 Features:
 - Creates a Material Library LOP in /stage.
-- Creates a MaterialX subnet inside the material library.
-- Builds a MaterialX network from texture files.
+- Creates MaterialX or PXR shader networks from texture files.
 - Supports UDIM token conversion (<UDIM>) via UI toggle.
 """
 
+import os
 import re
 import random
+import shutil
+import subprocess
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
@@ -56,6 +58,13 @@ TEXTURE_NODE_COLORS = {
     "subsurface": (0.96, 0.48, 0.36),
 }
 
+MATERIAL_BUILDERS = (
+    ("materialx", "MaterialX"),
+    ("pxr", "PXR"),
+)
+
+MATERIAL_BUILDER_LABELS = {key: label for key, label in MATERIAL_BUILDERS}
+
 
 @dataclass(frozen=True)
 class MaterialChannel:
@@ -76,6 +85,92 @@ class UDIMHandler:
         if "<udim>" in path.lower():
             return re.sub(r"(?i)<udim>", "<UDIM>", path)
         return cls._udim_pattern.sub("<UDIM>", path, count=1)
+
+
+class TextureConverter:
+    @staticmethod
+    def _rman_tree():
+        if hou:
+            try:
+                rman_tree = hou.getenv("RMANTREE")
+                if rman_tree:
+                    return rman_tree
+            except Exception:
+                pass
+        return os.environ.get("RMANTREE")
+
+    @classmethod
+    def find_converter(cls):
+        candidates = []
+
+        rman_tree = cls._rman_tree()
+        if rman_tree:
+            candidates.append(("txmake", Path(rman_tree) / "bin" / "txmake"))
+
+        txmake_path = shutil.which("txmake")
+        if txmake_path:
+            candidates.append(("txmake", Path(txmake_path)))
+
+        maketx_path = shutil.which("maketx")
+        if maketx_path:
+            candidates.append(("maketx", Path(maketx_path)))
+
+        for tool_name, tool_path in candidates:
+            try:
+                if tool_path.exists():
+                    return tool_name, tool_path.as_posix()
+            except Exception:
+                continue
+
+        return None, None
+
+    @classmethod
+    def convert_to_tex(cls, source_path):
+        source = Path(str(source_path)).expanduser()
+        if not source.exists() or not source.is_file():
+            raise RuntimeError(f"Texture file not found: {source.as_posix()}")
+
+        if source.suffix.lower() == ".tex":
+            return source.as_posix(), False
+
+        destination = source.with_suffix(".tex")
+        try:
+            if destination.exists() and destination.stat().st_mtime >= source.stat().st_mtime:
+                return destination.as_posix(), False
+        except Exception:
+            pass
+
+        tool_name, executable = cls.find_converter()
+        if not executable:
+            raise RuntimeError(
+                "Could not find txmake/maketx. Ensure RenderMan is installed and RMANTREE is set."
+            )
+
+        if tool_name == "maketx":
+            cmd = [executable, source.as_posix(), "-o", destination.as_posix()]
+        else:
+            cmd = [executable, source.as_posix(), destination.as_posix()]
+
+        result = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+        )
+        if result.returncode != 0:
+            raw_error = (result.stderr or result.stdout or "").strip()
+            error_line = raw_error.splitlines()[-1] if raw_error else "unknown conversion error"
+            raise RuntimeError(
+                f"Failed converting '{source.name}' with {tool_name}: {error_line}"
+            )
+
+        if not destination.exists():
+            raise RuntimeError(
+                f"Conversion finished but .tex output was not found: {destination.as_posix()}"
+            )
+
+        return destination.as_posix(), True
 
 
 class MaterialChannelLibrary:
@@ -340,15 +435,30 @@ class MaterialChannelLibrary:
 
 
 class MaterialBuilder:
-    def __init__(self, material_name, use_udim=False):
+    MATERIALX = "materialx"
+    PXR = "pxr"
+
+    def __init__(self, material_name, use_udim=False, builder_type=MATERIALX):
         self.material_name = self._sanitize_name(material_name)
         self.use_udim = bool(use_udim)
+        self.builder_type = self._normalize_builder_type(builder_type)
         self.textures = {}
+
+    @classmethod
+    def _normalize_builder_type(cls, builder_type):
+        normalized = str(builder_type or "").strip().lower()
+        if normalized == cls.PXR:
+            return cls.PXR
+        return cls.MATERIALX
 
     @staticmethod
     def _sanitize_name(name):
         clean = re.sub(r"[^a-zA-Z0-9_]+", "_", (name or "").strip())
         return clean or "Material"
+
+    @staticmethod
+    def _normalize_lookup_key(value):
+        return re.sub(r"[^a-z0-9]+", "", str(value or "").lower())
 
     def add_texture(self, channel, filepath):
         if not filepath:
@@ -392,42 +502,50 @@ class MaterialBuilder:
                     suffix += 1
                 target_name = f"{target_name}_{suffix}"
 
+        if self.builder_type == self.PXR:
+            material_subnet_types = ("pxrmaterialbuilder",)
+        else:
+            material_subnet_types = ("subnet", "subnetvop")
+
         material_subnet = self._create_node_with_fallback(
             material_parent,
             target_name,
-            ("subnet", "subnetvop"),
+            material_subnet_types,
         )
         try:
             material_subnet.setMaterialFlag(True)
         except Exception:
             pass
         self._set_random_node_color(material_subnet)
-        self._remove_default_subnet_io(material_subnet)
 
-        shader = self._create_node_with_fallback(
-            material_subnet,
-            "standard_surface",
-            ("mtlxstandard_surface", "mtlxstandardsurface"),
-        )
+        if self.builder_type == self.PXR:
+            # Keep default PXR builder I/O so RenderMan outputs remain valid.
+            shader = self._create_surface_shader(material_subnet)
+            self._connect_pxr_outputs(material_subnet, surface_source=shader)
+            self._connect_textures(material_subnet, shader, None)
+        else:
+            self._remove_default_subnet_io(material_subnet)
 
-        surface_output = self._create_subnet_connector(
-            material_subnet,
-            node_name="surface_output",
-            parm_name="surface",
-            parm_label="Surface",
-            parm_type="surface",
-        )
-        self._connect_output(surface_output, shader)
+            shader = self._create_surface_shader(material_subnet)
 
-        displacement_output = self._create_subnet_connector(
-            material_subnet,
-            node_name="displacement_output",
-            parm_name="displacement",
-            parm_label="Displacement",
-            parm_type="displacement",
-        )
+            surface_output = self._create_subnet_connector(
+                material_subnet,
+                node_name="surface_output",
+                parm_name="surface",
+                parm_label="Surface",
+                parm_type="surface",
+            )
+            self._connect_output(surface_output, shader)
 
-        self._connect_textures(material_subnet, shader, displacement_output)
+            displacement_output = self._create_subnet_connector(
+                material_subnet,
+                node_name="displacement_output",
+                parm_name="displacement",
+                parm_label="Displacement",
+                parm_type="displacement",
+            )
+
+            self._connect_textures(material_subnet, shader, displacement_output)
 
         material_subnet.layoutChildren()
         if material_parent != matlib:
@@ -474,21 +592,98 @@ class MaterialBuilder:
             except Exception:
                 continue
 
+    @staticmethod
+    def _node_type_base_name(node_type_name):
+        return str(node_type_name or "").split("::", 1)[0]
+
+    @staticmethod
+    def _node_type_sort_key(node_type_name):
+        parts = str(node_type_name or "").split("::", 1)
+        if len(parts) < 2:
+            return ((), "")
+        suffix = parts[1]
+        tokens = tuple(int(token) for token in re.findall(r"\d+", suffix))
+        return (tokens, suffix.lower())
+
+    @classmethod
+    def _resolve_node_type_name(cls, parent, node_type):
+        try:
+            category = parent.childTypeCategory()
+        except Exception:
+            return None
+        if not category:
+            return None
+
+        try:
+            node_types = category.nodeTypes()
+        except Exception:
+            return None
+
+        if not node_types:
+            return None
+
+        node_type_str = str(node_type)
+        if node_type_str in node_types:
+            return node_type_str
+
+        target_base = cls._node_type_base_name(node_type_str).lower()
+        matches = [
+            name
+            for name in node_types.keys()
+            if cls._node_type_base_name(name).lower() == target_base
+        ]
+        if not matches:
+            return None
+
+        matches.sort(key=cls._node_type_sort_key, reverse=True)
+        return matches[0]
+
+    @classmethod
+    def _find_child_by_type_base(cls, parent, type_bases):
+        expected = {cls._normalize_lookup_key(item) for item in type_bases}
+        for child in parent.children():
+            try:
+                type_name = child.type().name()
+            except Exception:
+                continue
+            base_name = cls._normalize_lookup_key(cls._node_type_base_name(type_name))
+            if base_name in expected:
+                return child
+        return None
+
     @classmethod
     def _create_node_with_fallback(cls, parent, node_name, node_types):
+        tried_types = []
         last_exc = None
-        for node_type in node_types:
-            try:
-                return cls._create_node(parent, node_type, node_name)
-            except RuntimeError as exc:
-                last_exc = exc
-                continue
+        for requested_type in node_types:
+            candidate_types = [requested_type]
+            resolved_type = cls._resolve_node_type_name(parent, requested_type)
+            if resolved_type and resolved_type not in candidate_types:
+                candidate_types.append(resolved_type)
+
+            for node_type in candidate_types:
+                if node_type in tried_types:
+                    continue
+                tried_types.append(node_type)
+                try:
+                    return cls._create_node(parent, node_type, node_name)
+                except RuntimeError as exc:
+                    last_exc = exc
+                    continue
+
         parent_path = parent.path() if hasattr(parent, "path") else str(parent)
-        tried = ", ".join(node_types)
+        tried = ", ".join(str(node_type) for node_type in (tried_types or node_types))
         raise RuntimeError(
             f"Failed to create node '{node_name}' in '{parent_path}'. Tried: {tried}. "
             f"Last error: {last_exc}"
         )
+
+    @classmethod
+    def _try_create_node_with_fallback(cls, parent, node_name, node_types):
+        try:
+            return cls._create_node_with_fallback(parent, node_name, node_types)
+        except Exception:
+            return None
 
     @staticmethod
     def _has_vop_children(node):
@@ -598,11 +793,266 @@ class MaterialBuilder:
     @classmethod
     def _set_input_by_names(cls, node, input_names, source_node):
         for input_name in input_names:
-            index = node.inputIndex(input_name)
+            try:
+                index = node.inputIndex(input_name)
+            except Exception:
+                continue
             if index >= 0:
                 node.setInput(index, source_node)
                 return True
         return False
+
+    @classmethod
+    def _set_input_by_keywords(cls, node, keywords, source_node):
+        normalized_keywords = [
+            cls._normalize_lookup_key(keyword)
+            for keyword in keywords
+            if cls._normalize_lookup_key(keyword)
+        ]
+        if not normalized_keywords:
+            return False
+
+        try:
+            input_names = node.inputNames()
+        except Exception:
+            return False
+
+        for index, input_name in enumerate(input_names):
+            normalized_input = cls._normalize_lookup_key(input_name)
+            if not normalized_input:
+                continue
+            for keyword in normalized_keywords:
+                if keyword in normalized_input:
+                    try:
+                        node.setInput(index, source_node)
+                        return True
+                    except Exception:
+                        continue
+        return False
+
+    def _connect_shader_input(self, shader, source_node, input_names=(), keyword_names=()):
+        if shader is None or source_node is None:
+            return False
+        if input_names and self._set_input_by_names(shader, input_names, source_node):
+            return True
+        keywords = keyword_names or input_names
+        if keywords:
+            return self._set_input_by_keywords(shader, keywords, source_node)
+        return False
+
+    @staticmethod
+    def _input_names(node):
+        try:
+            return tuple(node.inputNames())
+        except Exception:
+            return tuple()
+
+    @classmethod
+    def _node_has_input_keywords(cls, node, keywords):
+        normalized_keywords = [
+            cls._normalize_lookup_key(keyword)
+            for keyword in keywords
+            if cls._normalize_lookup_key(keyword)
+        ]
+        if not normalized_keywords:
+            return False
+
+        for input_name in cls._input_names(node):
+            normalized_input = cls._normalize_lookup_key(input_name)
+            if not normalized_input:
+                continue
+            for keyword in normalized_keywords:
+                if keyword in normalized_input:
+                    return True
+        return False
+
+    @classmethod
+    def _find_pxr_output_node(cls, parent):
+        named_collect = parent.node("output_collect")
+        if named_collect is not None:
+            return named_collect
+
+        named = parent.node("suboutput1")
+        if named is not None:
+            return named
+
+        type_priority = (
+            ("collect", "collectvop", "output_collect", "pxrmaterialoutput"),
+            ("suboutput", "subnetconnector"),
+        )
+
+        for type_bases in type_priority:
+            for child in parent.children():
+                try:
+                    type_name = child.type().name()
+                except Exception:
+                    continue
+                base_name = cls._normalize_lookup_key(cls._node_type_base_name(type_name))
+                expected = {cls._normalize_lookup_key(item) for item in type_bases}
+                if base_name not in expected:
+                    continue
+                if "collect" in base_name:
+                    return child
+                if cls._node_has_input_keywords(
+                    child,
+                    ("bxdf", "surface", "ri:bxdf", "displacement", "ri:displacement"),
+                ):
+                    return child
+
+        for child in parent.children():
+            if cls._node_has_input_keywords(
+                child,
+                ("bxdf", "surface", "ri:bxdf", "displacement", "ri:displacement"),
+            ):
+                return child
+
+        # Last-resort fallback: some builders may not expose a pre-created output node.
+        try:
+            return cls._create_node_with_fallback(parent, "suboutput1", ("suboutput", "subnetconnector"))
+        except Exception:
+            return None
+
+    @staticmethod
+    def _is_input_connected(target_node, source_node):
+        try:
+            for connected in target_node.inputs():
+                if connected == source_node:
+                    return True
+        except Exception:
+            return False
+        return False
+
+    def _connect_pxr_outputs(self, parent, surface_source=None, displacement_source=None):
+        output_node = self._find_pxr_output_node(parent)
+        if output_node is None:
+            return False
+
+        connected = False
+        try:
+            output_base = self._normalize_lookup_key(
+                self._node_type_base_name(output_node.type().name())
+            )
+        except Exception:
+            output_base = ""
+        is_collect_output = "collect" in output_base
+
+        def _output_index(node, output_names):
+            for output_name in output_names:
+                try:
+                    index = node.outputIndex(output_name)
+                except Exception:
+                    continue
+                if index >= 0:
+                    return index
+            return 0
+
+        if surface_source is not None:
+            connected_surface = False
+            source_output_names = ("bxdf_out", "bxdf", "surface", "out", "Shader")
+            surface_output_index = _output_index(
+                surface_source,
+                source_output_names,
+            )
+            surface_input_names = (
+                "shader1",
+                "shader",
+                "material1",
+                "material",
+                "bxdf",
+                "surface",
+                "ri:bxdf",
+                "input1",
+                "input",
+            )
+            for input_name in surface_input_names:
+                for output_name in source_output_names:
+                    try:
+                        output_node.setNamedInput(input_name, surface_source, output_name)
+                        if self._is_input_connected(output_node, surface_source):
+                            connected_surface = True
+                            break
+                    except Exception:
+                        continue
+                if connected_surface:
+                    break
+            if not connected_surface:
+                index_candidates = (0, 1, 2) if is_collect_output else (0, 2)
+                for input_index in index_candidates:
+                    try:
+                        output_node.setInput(input_index, surface_source, surface_output_index)
+                        if self._is_input_connected(output_node, surface_source):
+                            connected_surface = True
+                            break
+                    except Exception:
+                        continue
+            try:
+                if not connected_surface:
+                    connected_surface = self._connect_shader_input(
+                        output_node,
+                        surface_source,
+                        (
+                            "shader1",
+                            "shader",
+                            "material1",
+                            "bxdf",
+                            "surface",
+                            "ri:bxdf",
+                            "input1",
+                        ),
+                        (
+                            "shader1",
+                            "shader",
+                            "material1",
+                            "bxdf",
+                            "surface",
+                            "ribxdf",
+                            "input1",
+                        ),
+                    )
+            except Exception:
+                connected_surface = False
+            connected = connected_surface or connected
+
+        if displacement_source is not None:
+            connected_displacement = False
+            source_output_names = ("displace_out", "displacement", "out")
+            displacement_output_index = _output_index(
+                displacement_source,
+                source_output_names,
+            )
+            for input_name in ("displacement", "displace", "ri:displacement", "input2"):
+                for output_name in source_output_names:
+                    try:
+                        output_node.setNamedInput(input_name, displacement_source, output_name)
+                        if self._is_input_connected(output_node, displacement_source):
+                            connected_displacement = True
+                            break
+                    except Exception:
+                        continue
+                if connected_displacement:
+                    break
+            if not connected_displacement:
+                for input_index in (1, 3):
+                    try:
+                        output_node.setInput(input_index, displacement_source, displacement_output_index)
+                        if self._is_input_connected(output_node, displacement_source):
+                            connected_displacement = True
+                            break
+                    except Exception:
+                        continue
+            try:
+                if not connected_displacement:
+                    connected_displacement = self._connect_shader_input(
+                        output_node,
+                        displacement_source,
+                        ("displacement", "displace", "ri:displacement", "input2"),
+                        ("displacement", "displace", "ridisplacement", "input2"),
+                    )
+            except Exception:
+                connected_displacement = False
+            connected = connected_displacement or connected
+
+        return connected
 
     @staticmethod
     def _set_raw_colorspace(tex_node):
@@ -656,7 +1106,29 @@ class MaterialBuilder:
         except Exception:
             pass
 
+    def _create_surface_shader(self, parent):
+        if self.builder_type == self.PXR:
+            existing_shader = self._find_child_by_type_base(parent, ("pxrsurface", "pxrdisney"))
+            if existing_shader is not None:
+                return existing_shader
+            return self._create_node_with_fallback(
+                parent,
+                "surface_shader",
+                ("pxrsurface", "pxrdisney"),
+            )
+
+        return self._create_node_with_fallback(
+            parent,
+            "standard_surface",
+            ("mtlxstandard_surface", "mtlxstandardsurface"),
+        )
+
     def _create_texture_node(self, parent, channel_name, texture_path):
+        if self.builder_type == self.PXR:
+            return self._create_pxr_texture_node(parent, channel_name, texture_path)
+        return self._create_materialx_texture_node(parent, channel_name, texture_path)
+
+    def _create_materialx_texture_node(self, parent, channel_name, texture_path):
         tex_node = self._create_node_with_fallback(
             parent,
             "tex_" + channel_name,
@@ -681,7 +1153,72 @@ class MaterialBuilder:
 
         return tex_node
 
-    def _connect_base_and_ao(self, parent, shader):
+    def _create_pxr_texture_node(self, parent, channel_name, texture_path):
+        tex_node = self._create_node_with_fallback(
+            parent,
+            "tex_" + channel_name,
+            ("pxrtexture",),
+        )
+        if not self._set_first_available_parm(
+            tex_node,
+            ("filename", "filename0", "file", "tex0", "map"),
+            texture_path,
+        ):
+            raise RuntimeError(
+                "Could not set texture path on node '{0}' ({1}).".format(
+                    tex_node.path(),
+                    tex_node.type().name(),
+                )
+            )
+        self._set_node_color(tex_node, channel_name)
+
+        channel = MaterialChannelLibrary.channel(channel_name)
+        if channel and channel.raw_colorspace:
+            self._set_raw_colorspace(tex_node)
+
+        return tex_node
+
+    def _create_pxr_to_float(self, parent, node_name, source_node):
+        to_float = self._create_node_with_fallback(
+            parent,
+            node_name,
+            ("pxrtofloat",),
+        )
+        try:
+            to_float.setNamedInput("input", source_node, "resultRGB")
+        except Exception:
+            to_float.setInput(0, source_node, 0)
+        return to_float
+
+    @classmethod
+    def _connect_to_pxr_normal_input(cls, normal_map_node, texture_node):
+        output_names = ("resultRGB", "result", "out", "rgb")
+        input_names = ("inputRGB", "input", "in")
+
+        for input_name in input_names:
+            for output_name in output_names:
+                try:
+                    normal_map_node.setNamedInput(input_name, texture_node, output_name)
+                    return True
+                except Exception:
+                    continue
+
+        if cls._set_input_by_names(normal_map_node, input_names, texture_node):
+            return True
+
+        # Last fallback for node variants that only expose positional inputs.
+        try:
+            normal_map_node.setInput(1, texture_node, 0)
+            return True
+        except Exception:
+            pass
+        try:
+            normal_map_node.setInput(0, texture_node, 0)
+            return True
+        except Exception:
+            return False
+
+    def _connect_base_and_ao_materialx(self, parent, shader):
         base_path = self.textures.get("base_color")
         ao_path = self.textures.get("ao")
 
@@ -690,7 +1227,7 @@ class MaterialBuilder:
 
         base_tex = self._create_texture_node(parent, "base_color", base_path)
         if not ao_path:
-            self._set_input_by_name(shader, "base_color", base_tex)
+            self._connect_shader_input(shader, base_tex, ("base_color",))
             return
 
         ao_tex = self._create_texture_node(parent, "ao", ao_path)
@@ -703,15 +1240,42 @@ class MaterialBuilder:
         multiply.setInput(0, base_tex)
         multiply.setInput(1, convert)
 
-        self._set_input_by_name(shader, "base_color", multiply)
+        self._connect_shader_input(shader, multiply, ("base_color",))
+
+    def _connect_base_and_ao_pxr(self, parent, shader):
+        base_path = self.textures.get("base_color")
+        if base_path:
+            base_tex = self._create_texture_node(parent, "base_color", base_path)
+            self._connect_shader_input(
+                shader,
+                base_tex,
+                ("baseColor", "base_color", "diffuseColor"),
+                ("basecolor", "diffusecolor"),
+            )
+
+        ao_path = self.textures.get("ao")
+        if ao_path:
+            ao_tex = self._create_texture_node(parent, "ao", ao_path)
+            self._connect_shader_input(
+                shader,
+                ao_tex,
+                ("ambientOcclusion", "occlusion", "ao"),
+                ("ambientocclusion", "occlusion", "ao"),
+            )
 
     def _connect_textures(self, parent, shader, displacement_output):
-        self._connect_base_and_ao(parent, shader)
+        if self.builder_type == self.PXR:
+            self._connect_textures_pxr(parent, shader, displacement_output)
+            return
+        self._connect_textures_materialx(parent, shader, displacement_output)
+
+    def _connect_textures_materialx(self, parent, shader, displacement_output):
+        self._connect_base_and_ao_materialx(parent, shader)
 
         roughness_path = self.textures.get("roughness")
         if roughness_path:
             roughness_tex = self._create_texture_node(parent, "roughness", roughness_path)
-            self._set_input_by_name(shader, "specular_roughness", roughness_tex)
+            self._connect_shader_input(shader, roughness_tex, ("specular_roughness",))
         else:
             gloss_path = self.textures.get("glossiness")
             if gloss_path:
@@ -724,19 +1288,19 @@ class MaterialBuilder:
                 if outhigh is not None:
                     outhigh.set(0.0)
                 invert_gloss.setInput(0, gloss_tex)
-                self._set_input_by_name(shader, "specular_roughness", invert_gloss)
+                self._connect_shader_input(shader, invert_gloss, ("specular_roughness",))
 
         metalness_path = self.textures.get("metalness")
         if metalness_path:
             metalness_tex = self._create_texture_node(parent, "metalness", metalness_path)
-            self._set_input_by_name(shader, "metalness", metalness_tex)
+            self._connect_shader_input(shader, metalness_tex, ("metalness",))
 
         normal_path = self.textures.get("normal")
         if normal_path:
             normal_tex = self._create_texture_node(parent, "normal", normal_path)
             normal_map = self._create_node(parent, "mtlxnormalmap", "normal_map")
             normal_map.setInput(0, normal_tex)
-            self._set_input_by_name(shader, "normal", normal_map)
+            self._connect_shader_input(shader, normal_map, ("normal",))
 
         displacement_path = self.textures.get("displacement")
         if displacement_path:
@@ -751,36 +1315,228 @@ class MaterialBuilder:
         opacity_path = self.textures.get("opacity")
         if opacity_path:
             opacity_tex = self._create_texture_node(parent, "opacity", opacity_path)
-            self._set_input_by_name(shader, "opacity", opacity_tex)
+            self._connect_shader_input(shader, opacity_tex, ("opacity",))
 
         emission_path = self.textures.get("emission_color")
         if emission_path:
             emission_tex = self._create_texture_node(parent, "emission_color", emission_path)
-            self._set_input_by_names(shader, ("emission_color", "emission"), emission_tex)
+            self._connect_shader_input(
+                shader,
+                emission_tex,
+                ("emission_color", "emission"),
+                ("emissioncolor", "emission"),
+            )
 
         specular_path = self.textures.get("specular")
         if specular_path:
             specular_tex = self._create_texture_node(parent, "specular", specular_path)
-            self._set_input_by_name(shader, "specular", specular_tex)
+            self._connect_shader_input(shader, specular_tex, ("specular",))
 
         transmission_path = self.textures.get("transmission")
         if transmission_path:
             transmission_tex = self._create_texture_node(parent, "transmission", transmission_path)
-            self._set_input_by_name(shader, "transmission", transmission_tex)
+            self._connect_shader_input(shader, transmission_tex, ("transmission",))
 
         translucency_path = self.textures.get("translucency")
         if translucency_path:
             translucency_tex = self._create_texture_node(parent, "translucency", translucency_path)
-            self._set_input_by_names(
+            self._connect_shader_input(
                 shader,
-                ("transmission_color", "transmission"),
                 translucency_tex,
+                ("transmission_color", "transmission"),
+                ("transmissioncolor", "transmission"),
             )
 
         subsurface_path = self.textures.get("subsurface")
         if subsurface_path:
             subsurface_tex = self._create_texture_node(parent, "subsurface", subsurface_path)
-            self._set_input_by_name(shader, "subsurface", subsurface_tex)
+            self._connect_shader_input(shader, subsurface_tex, ("subsurface",))
+
+    def _connect_textures_pxr(self, parent, shader, displacement_output):
+        self._connect_base_and_ao_pxr(parent, shader)
+
+        roughness_path = self.textures.get("roughness")
+        if roughness_path:
+            roughness_tex = self._create_texture_node(parent, "roughness", roughness_path)
+            roughness_to_float = self._create_pxr_to_float(parent, "roughness_to_float", roughness_tex)
+            self._connect_shader_input(
+                shader,
+                roughness_to_float,
+                ("roughness", "specularRoughness"),
+                ("roughness", "specularroughness"),
+            )
+        else:
+            gloss_path = self.textures.get("glossiness")
+            if gloss_path:
+                gloss_tex = self._create_texture_node(parent, "glossiness", gloss_path)
+                roughness_source = gloss_tex
+                invert_gloss = self._try_create_node_with_fallback(
+                    parent,
+                    "invert_gloss",
+                    ("pxrinvert", "mtlxremap", "invert"),
+                )
+                if invert_gloss is not None:
+                    outlow = invert_gloss.parm("outlow")
+                    outhigh = invert_gloss.parm("outhigh")
+                    if outlow is not None:
+                        outlow.set(1.0)
+                    if outhigh is not None:
+                        outhigh.set(0.0)
+                    invert_gloss.setInput(0, gloss_tex)
+                    roughness_source = invert_gloss
+                roughness_to_float = self._create_pxr_to_float(
+                    parent,
+                    "glossiness_to_float",
+                    roughness_source,
+                )
+                self._connect_shader_input(
+                    shader,
+                    roughness_to_float,
+                    ("roughness", "specularRoughness"),
+                    ("roughness", "specularroughness"),
+                )
+
+        metalness_path = self.textures.get("metalness")
+        if metalness_path:
+            metalness_tex = self._create_texture_node(parent, "metalness", metalness_path)
+            metalness_to_float = self._create_pxr_to_float(parent, "metalness_to_float", metalness_tex)
+            self._connect_shader_input(
+                shader,
+                metalness_to_float,
+                ("metalness", "metallic"),
+                ("metalness", "metallic"),
+            )
+
+        normal_path = self.textures.get("normal")
+        if normal_path:
+            normal_tex = self._create_texture_node(parent, "normal", normal_path)
+            normal_source = normal_tex
+            normal_map = self._try_create_node_with_fallback(
+                parent,
+                "normal_map",
+                ("pxrnormalmap", "normalmap"),
+            )
+            if normal_map is not None:
+                self._connect_to_pxr_normal_input(normal_map, normal_tex)
+                normal_source = normal_map
+            self._connect_shader_input(
+                shader,
+                normal_source,
+                ("normal", "bumpNormal"),
+                ("normal", "bumpnormal"),
+            )
+
+        displacement_path = self.textures.get("displacement")
+        if displacement_path:
+            displacement_tex = self._create_texture_node(parent, "displacement", displacement_path)
+            displacement_to_float = self._create_pxr_to_float(
+                parent,
+                "displacement_to_float",
+                displacement_tex,
+            )
+            displacement_source = displacement_to_float
+            disp_transform = self._try_create_node_with_fallback(
+                parent,
+                "pxr_disp_transform",
+                ("pxrdisptransform",),
+            )
+            if disp_transform is not None:
+                try:
+                    disp_transform.setNamedInput("dispScalar", displacement_to_float, "resultF")
+                except Exception:
+                    disp_transform.setInput(0, displacement_to_float, 0)
+                self._set_first_available_parm(disp_transform, ("dispRemapMode",), 2)
+                displacement_source = disp_transform
+            displacement_node = self._try_create_node_with_fallback(
+                parent,
+                "displacement",
+                ("pxrdisplace",),
+            )
+            if displacement_node is not None:
+                try:
+                    displacement_node.setNamedInput("dispScalar", displacement_source, "resultF")
+                except Exception:
+                    displacement_node.setInput(0, displacement_source, 0)
+                self._set_first_available_parm(
+                    displacement_node,
+                    ("dispAmount", "displacementAmount", "scale", "amount"),
+                    0.05,
+                )
+                displacement_source = displacement_node
+            if displacement_output is not None:
+                self._connect_output(displacement_output, displacement_source)
+            else:
+                if not self._connect_pxr_outputs(
+                    parent,
+                    displacement_source=displacement_source,
+                ):
+                    self._connect_shader_input(
+                        shader,
+                        displacement_source,
+                        ("displacement",),
+                        ("displacement", "disp"),
+                    )
+
+        opacity_path = self.textures.get("opacity")
+        if opacity_path:
+            opacity_tex = self._create_texture_node(parent, "opacity", opacity_path)
+            opacity_to_float = self._create_pxr_to_float(parent, "opacity_to_float", opacity_tex)
+            self._connect_shader_input(
+                shader,
+                opacity_to_float,
+                ("presence", "opacity"),
+                ("presence", "opacity"),
+            )
+
+        emission_path = self.textures.get("emission_color")
+        if emission_path:
+            emission_tex = self._create_texture_node(parent, "emission_color", emission_path)
+            self._connect_shader_input(
+                shader,
+                emission_tex,
+                ("emitColor", "emissionColor", "emission"),
+                ("emitcolor", "emissioncolor", "emission"),
+            )
+
+        specular_path = self.textures.get("specular")
+        if specular_path:
+            specular_tex = self._create_texture_node(parent, "specular", specular_path)
+            self._connect_shader_input(
+                shader,
+                specular_tex,
+                ("specular", "specularFaceColor"),
+                ("specularfacecolor", "specular"),
+            )
+
+        transmission_path = self.textures.get("transmission")
+        if transmission_path:
+            transmission_tex = self._create_texture_node(parent, "transmission", transmission_path)
+            self._connect_shader_input(
+                shader,
+                transmission_tex,
+                ("transmission", "refractionGain"),
+                ("transmission", "refraction"),
+            )
+
+        translucency_path = self.textures.get("translucency")
+        if translucency_path:
+            translucency_tex = self._create_texture_node(parent, "translucency", translucency_path)
+            self._connect_shader_input(
+                shader,
+                translucency_tex,
+                ("transmissionColor", "subsurfaceColor"),
+                ("transmissioncolor", "subsurfacecolor"),
+            )
+
+        subsurface_path = self.textures.get("subsurface")
+        if subsurface_path:
+            subsurface_tex = self._create_texture_node(parent, "subsurface", subsurface_path)
+            self._connect_shader_input(
+                shader,
+                subsurface_tex,
+                ("subsurfaceColor", "subsurface"),
+                ("subsurfacecolor", "subsurface"),
+            )
 
 
 def show_ui(parent=None):
@@ -843,10 +1599,12 @@ def show_ui(parent=None):
             self.setMinimumHeight(680)
 
             self.manual_fields = {}
+            self._converted_texture_paths = {}
             self._build_ui()
             self._apply_style()
             self._on_mode_toggled(self.auto_detect_check.isChecked())
             self._on_auto_name_toggled(self.auto_name_check.isChecked())
+            self._update_create_button_text()
             self._update_summary({})
             self._set_info("Ready.", "info")
 
@@ -872,6 +1630,19 @@ def show_ui(parent=None):
             name_row.addWidget(self.material_name_edit, 1)
             settings_layout.addLayout(name_row, 0, 0, 1, 4)
 
+            builder_row = QtWidgets.QHBoxLayout()
+            builder_row.setContentsMargins(0, 0, 0, 0)
+            builder_row.setSpacing(8)
+            builder_label = QtWidgets.QLabel("Builder Type")
+            builder_label.setMinimumWidth(95)
+            builder_row.addWidget(builder_label)
+            self.builder_type_combo = QtWidgets.QComboBox()
+            for builder_key, builder_label in MATERIAL_BUILDERS:
+                self.builder_type_combo.addItem(builder_label, builder_key)
+            self.builder_type_combo.currentIndexChanged.connect(self._on_builder_type_changed)
+            builder_row.addWidget(self.builder_type_combo, 1)
+            settings_layout.addLayout(builder_row, 1, 0, 1, 4)
+
             self.auto_name_check = QtWidgets.QCheckBox("Auto detect material name")
             self.auto_name_check.setChecked(True)
             self.auto_name_check.toggled.connect(self._on_auto_name_toggled)
@@ -891,7 +1662,7 @@ def show_ui(parent=None):
             toggles_row.addWidget(self.udim_check)
             toggles_row.addWidget(self.auto_detect_check)
             toggles_row.addStretch(1)
-            settings_layout.addLayout(toggles_row, 1, 0, 1, 4)
+            settings_layout.addLayout(toggles_row, 2, 0, 1, 4)
 
             root_layout.addWidget(settings_group)
 
@@ -917,7 +1688,11 @@ def show_ui(parent=None):
             self.preview_btn.clicked.connect(self._preview_textures)
             buttons_layout.addWidget(self.preview_btn)
 
-            self.create_btn = QtWidgets.QPushButton("Create MaterialX in LOPs")
+            self.convert_btn = QtWidgets.QPushButton("Convert Textures to .tex")
+            self.convert_btn.clicked.connect(self._convert_textures_to_tex)
+            buttons_layout.addWidget(self.convert_btn)
+
+            self.create_btn = QtWidgets.QPushButton("Create Material in LOPs")
             self.create_btn.clicked.connect(self._create_material)
             buttons_layout.addWidget(self.create_btn)
 
@@ -1067,6 +1842,158 @@ def show_ui(parent=None):
         def _image_dialog_filter():
             extensions = " ".join("*" + ext for ext in sorted(SUPPORTED_IMAGE_EXTENSIONS))
             return "Image Files ({0});;All Files (*)".format(extensions)
+
+        def _selected_builder_type(self):
+            return MaterialBuilder._normalize_builder_type(self.builder_type_combo.currentData())
+
+        def _selected_builder_label(self):
+            return MATERIAL_BUILDER_LABELS.get(self._selected_builder_type(), "MaterialX")
+
+        def _on_builder_type_changed(self, _index):
+            self._update_create_button_text()
+
+        def _update_create_button_text(self):
+            self.create_btn.setText("Create {0} in LOPs".format(self._selected_builder_label()))
+
+        @staticmethod
+        def _normalize_texture_path(path_value):
+            return Path(str(path_value or "")).expanduser().as_posix()
+
+        def _resolve_texture_path_for_build(self, texture_path):
+            normalized = self._normalize_texture_path(texture_path)
+            converted = self._converted_texture_paths.get(normalized)
+            if converted:
+                return converted
+
+            if self._selected_builder_type() == MaterialBuilder.PXR:
+                tex_candidate = Path(normalized).with_suffix(".tex")
+                if tex_candidate.exists():
+                    return tex_candidate.as_posix()
+
+            return normalized
+
+        def _collect_texture_paths_for_conversion(self):
+            texture_paths = []
+
+            if self.auto_detect_check.isChecked():
+                for group in self._collect_auto_material_groups():
+                    for texture_path in group["textures"].values():
+                        texture_paths.append(texture_path)
+            else:
+                texture_paths.extend(self._collect_manual_textures().values())
+
+            unique_paths = []
+            seen = set()
+            for texture_path in texture_paths:
+                normalized = self._normalize_texture_path(texture_path)
+                if not normalized or normalized in seen:
+                    continue
+                seen.add(normalized)
+                unique_paths.append(normalized)
+
+            return unique_paths
+
+        def _replace_manual_texture_path(self, source_path, converted_path):
+            source_norm = self._normalize_texture_path(source_path)
+            converted_norm = self._normalize_texture_path(converted_path)
+            for line_edit in self.manual_fields.values():
+                current = line_edit.text().strip()
+                if not current:
+                    continue
+                if self._normalize_texture_path(current) == source_norm:
+                    line_edit.setText(converted_norm)
+
+        def _convert_textures_to_tex(self):
+            self._set_busy(True)
+            try:
+                texture_paths = self._collect_texture_paths_for_conversion()
+                if not texture_paths:
+                    self._set_progress(0, 1, "No textures found")
+                    self._set_info(
+                        "No textures found to convert. Add textures first.",
+                        "error",
+                    )
+                    return
+
+                tool_name, _tool_path = TextureConverter.find_converter()
+                if not tool_name:
+                    self._set_progress(1, 1, "Converter not found")
+                    self._set_info(
+                        "txmake/maketx not found. Ensure RenderMan is installed and RMANTREE is set.",
+                        "error",
+                    )
+                    return
+
+                total = len(texture_paths)
+                converted_count = 0
+                skipped_count = 0
+                failed = []
+
+                self._set_progress(0, total, f"Converting 0/{total} with {tool_name}")
+
+                for index, source_path in enumerate(texture_paths, start=1):
+                    label = Path(source_path).name
+                    self._set_progress(
+                        index - 1,
+                        total,
+                        "Converting {0}/{1}: {2}".format(index - 1, total, label),
+                    )
+                    try:
+                        converted_path, changed = TextureConverter.convert_to_tex(source_path)
+                        source_norm = self._normalize_texture_path(source_path)
+                        converted_norm = self._normalize_texture_path(converted_path)
+                        self._converted_texture_paths[source_norm] = converted_norm
+                        self._replace_manual_texture_path(source_norm, converted_norm)
+                        if changed:
+                            converted_count += 1
+                        else:
+                            skipped_count += 1
+                    except Exception as exc:
+                        failed.append((source_path, str(exc)))
+
+                    self._set_progress(
+                        index,
+                        total,
+                        "Converting {0}/{1}".format(index, total),
+                    )
+
+                self._preview_textures()
+
+                if failed and converted_count == 0 and skipped_count == 0:
+                    first_failed_path, first_failed_error = failed[0]
+                    self._set_info(
+                        "Conversion failed ({0}): {1}".format(
+                            Path(first_failed_path).name,
+                            first_failed_error,
+                        ),
+                        "error",
+                    )
+                    return
+
+                if failed:
+                    first_failed_path, first_failed_error = failed[0]
+                    self._set_info(
+                        "Converted {0}, skipped {1}, failed {2}. First failure ({3}): {4}".format(
+                            converted_count,
+                            skipped_count,
+                            len(failed),
+                            Path(first_failed_path).name,
+                            first_failed_error,
+                        ),
+                        "error",
+                    )
+                    return
+
+                self._set_info(
+                    "Texture conversion complete using {0}: converted {1}, up-to-date {2}.".format(
+                        tool_name,
+                        converted_count,
+                        skipped_count,
+                    ),
+                    "success",
+                )
+            finally:
+                self._set_busy(False)
 
         def _on_mode_toggled(self, is_auto):
             self.mode_stack.setCurrentIndex(0 if is_auto else 1)
@@ -1330,6 +2257,7 @@ def show_ui(parent=None):
         def _set_busy(self, is_busy):
             self.create_btn.setEnabled(not is_busy)
             self.preview_btn.setEnabled(not is_busy)
+            self.convert_btn.setEnabled(not is_busy)
             self.reset_btn.setEnabled(not is_busy)
             if is_busy:
                 self.setCursor(QtCore.Qt.WaitCursor)
@@ -1361,10 +2289,12 @@ def show_ui(parent=None):
 
         def _reset_ui(self):
             self.material_name_edit.setText("Material")
+            self.builder_type_combo.setCurrentIndex(0)
             self.auto_name_check.setChecked(True)
             self.udim_check.setChecked(True)
             self.auto_detect_check.setChecked(True)
             self.auto_paths_list.clear()
+            self._converted_texture_paths = {}
             for field in self.manual_fields.values():
                 field.clear()
             self._update_summary({})
@@ -1374,6 +2304,7 @@ def show_ui(parent=None):
         def _create_material(self):
             self._set_busy(True)
             try:
+                builder_type = self._selected_builder_type()
                 if self.auto_detect_check.isChecked():
                     groups = self._collect_auto_material_groups()
                     if not groups:
@@ -1416,9 +2347,13 @@ def show_ui(parent=None):
                         builder = MaterialBuilder(
                             material_name=material_name,
                             use_udim=self.udim_check.isChecked(),
+                            builder_type=builder_type,
                         )
                         for channel_name, texture_path in group["textures"].items():
-                            builder.add_texture(channel_name, texture_path)
+                            builder.add_texture(
+                                channel_name,
+                                self._resolve_texture_path_for_build(texture_path),
+                            )
 
                         try:
                             _matlib, subnet = builder.build()
@@ -1492,9 +2427,13 @@ def show_ui(parent=None):
                 builder = MaterialBuilder(
                     material_name=material_name,
                     use_udim=self.udim_check.isChecked(),
+                    builder_type=builder_type,
                 )
                 for channel_name, texture_path in textures.items():
-                    builder.add_texture(channel_name, texture_path)
+                    builder.add_texture(
+                        channel_name,
+                        self._resolve_texture_path_for_build(texture_path),
+                    )
 
                 try:
                     _matlib, subnet = builder.build()
