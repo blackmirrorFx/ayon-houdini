@@ -106,6 +106,7 @@ _READ_ALL_WEDGES_PARMS = (
     "all_wedges",
 )
 _SUBMIT_REVIEW_JOB_PARMS = (
+    "doflip",
     "doflipbook",
     "submit_review_job",
     "submit_flipbook_job",
@@ -307,6 +308,14 @@ def _expand_path_at_frame(path, frame=None):
 
 def _parse_version_value(raw_value):
     token = str(raw_value or "").strip().lower().lstrip("v")
+    parsed = _safe_int(token, 0)
+    return parsed if parsed > 0 else None
+
+
+def _parse_wedge_index_value(raw_value):
+    token = str(raw_value or "").strip().lower()
+    if token.startswith("w"):
+        token = token[1:]
     parsed = _safe_int(token, 0)
     return parsed if parsed > 0 else None
 
@@ -750,7 +759,53 @@ def eval_read_cache_object_mask(node_or_kwargs, frame=None):
 
 def read_wedge_index(node, prefer_env=False):
     wedge_parm = _first_parm(node, _READ_WEDGE_INDEX_PARMS)
-    parm_index = _safe_int(wedge_parm.eval(), 0) if wedge_parm else 0
+    parm_index = 0
+
+    if wedge_parm:
+        menu_labels = []
+        menu_items = []
+        try:
+            menu_labels = [str(label) for label in wedge_parm.menuLabels()]
+        except Exception:
+            menu_labels = []
+
+        try:
+            menu_items = [str(item) for item in wedge_parm.menuItems()]
+        except Exception:
+            menu_items = []
+
+        if menu_labels or menu_items:
+            try:
+                raw_index = _safe_int(wedge_parm.eval(), -1)
+            except Exception:
+                raw_index = -1
+
+            if 0 <= raw_index < len(menu_labels):
+                parm_index = _parse_wedge_index_value(menu_labels[raw_index]) or 0
+
+            if parm_index <= 0 and 0 <= raw_index < len(menu_items):
+                parm_index = _parse_wedge_index_value(menu_items[raw_index]) or 0
+
+            if parm_index <= 0:
+                try:
+                    raw_token = str(wedge_parm.evalAsString()).strip()
+                except Exception:
+                    raw_token = ""
+
+                if raw_token in menu_labels:
+                    parm_index = _parse_wedge_index_value(raw_token) or 0
+                elif raw_token in menu_items:
+                    parm_index = _parse_wedge_index_value(raw_token) or 0
+
+        if parm_index <= 0:
+            try:
+                parm_index = _parse_wedge_index_value(wedge_parm.evalAsString()) or 0
+            except Exception:
+                parm_index = 0
+
+        if parm_index <= 0:
+            parm_index = max(1, _safe_int(wedge_parm.eval(), 1))
+
     if parm_index > 0 and not prefer_env:
         return parm_index
 
@@ -761,8 +816,6 @@ def read_wedge_index(node, prefer_env=False):
     if parm_index > 0:
         return parm_index
 
-    if wedge_parm:
-        return max(1, _safe_int(wedge_parm.eval(), 1))
     return 1
 
 
@@ -1053,26 +1106,34 @@ def wedge_index_menu_items(node_or_kwargs):
     Dynamic menu items for single/read wedge selector.
     Returns [token1, label1, token2, label2, ...].
     """
-    node = _resolve_wedge_node(node_or_kwargs)
-    if not node:
+    try:
+        node = _resolve_wedge_node(node_or_kwargs)
+        if not node:
+            return ["1", "1"]
+
+        version = read_version(node) or _display_version(node) or active_version(node)
+        indices = _version_wedge_indices(node, version)
+        if not indices:
+            count_parm = _first_parm(node, _WEDGE_COUNT_PARMS)
+            fallback_count = max(1, _safe_int(count_parm.eval(), 1)) if count_parm else 1
+            indices = list(range(1, fallback_count + 1))
+
+        normalized_indices = []
+        for index in indices:
+            parsed = _parse_wedge_index_value(index)
+            if parsed and parsed > 0:
+                normalized_indices.append(parsed)
+
+        items = []
+        for wedge_index in sorted(set(normalized_indices)):
+            value = str(int(wedge_index))
+            items.extend([value, value])
+
+        if not items:
+            items = ["1", "1"]
+        return [str(item) for item in items]
+    except Exception:
         return ["1", "1"]
-
-    version = read_version(node) or _display_version(node) or active_version(node)
-    indices = _version_wedge_indices(node, version)
-    if not indices:
-        count_parm = _first_parm(node, _WEDGE_COUNT_PARMS)
-        fallback_count = max(1, _safe_int(count_parm.eval(), 1)) if count_parm else 1
-        indices = list(range(1, fallback_count + 1))
-
-    items = []
-    for wedge_index in sorted(set(int(i) for i in indices if int(i) > 0)):
-        token = str(int(wedge_index))
-        label = token
-        items.extend([token, label])
-
-    if not items:
-        items = ["1", "1"]
-    return items
 
 
 def ayon_context_json_path(node, version):
