@@ -1,0 +1,7 @@
+{
+    "python.analysis.extraPaths": [
+        "/home/ashutosh/.local/share/AYON/addons/core_1.9.6",
+        "/home/ashutosh/.local/share/AYON/addons/core_1.9.4",
+        "/home/ashutosh/.local/share/AYON/addons/core_1.8.4"
+    ]
+}

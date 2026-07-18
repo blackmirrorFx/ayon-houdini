@@ -124,6 +124,32 @@ class TextureConverter:
 
         return None, None
 
+    @staticmethod
+    def _ocio_config():
+        """Return the active OCIO config path, or None."""
+        if hou:
+            try:
+                cfg = hou.getenv("OCIO")
+                if cfg:
+                    return cfg
+            except Exception:
+                pass
+        return os.environ.get("OCIO")
+
+    @classmethod
+    def _run_converter(cls, cmd):
+        result = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+        )
+        if result.returncode != 0:
+            raw_error = (result.stderr or result.stdout or "").strip()
+            error_line = raw_error.splitlines()[-1] if raw_error else "unknown error"
+            raise RuntimeError(error_line)
+
     @classmethod
     def convert_to_tex(cls, source_path):
         source = Path(str(source_path)).expanduser()
@@ -151,23 +177,185 @@ class TextureConverter:
         else:
             cmd = [executable, source.as_posix(), destination.as_posix()]
 
-        result = subprocess.run(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            check=False,
-        )
-        if result.returncode != 0:
-            raw_error = (result.stderr or result.stdout or "").strip()
-            error_line = raw_error.splitlines()[-1] if raw_error else "unknown conversion error"
+        try:
+            cls._run_converter(cmd)
+        except RuntimeError as exc:
             raise RuntimeError(
-                f"Failed converting '{source.name}' with {tool_name}: {error_line}"
-            )
+                f"Failed converting '{source.name}' with {tool_name}: {exc}"
+            ) from exc
 
         if not destination.exists():
             raise RuntimeError(
                 f"Conversion finished but .tex output was not found: {destination.as_posix()}"
+            )
+
+        return destination.as_posix(), True
+
+    @classmethod
+    def convert_to_tex_aces(
+        cls,
+        source_path,
+        raw_channel=False,
+        src_colorspace="sRGB",
+        dst_colorspace="ACES - ACEScg",
+    ):
+        """Convert a texture to .tex with optional ACES colorspace transform.
+
+        Args:
+            source_path: Source texture file path.
+            raw_channel: If True the texture is a data map (normal, roughness,
+                metalness, etc.) and no colorspace conversion is applied.
+                If False (color map) the src->dst colorspace conversion is baked in.
+            src_colorspace: Source colorspace name (maketx / OCIO).
+            dst_colorspace: Target colorspace name (maketx / OCIO).
+
+        Returns:
+            (destination_path, was_converted) tuple.
+        """
+        source = Path(str(source_path)).expanduser()
+        if not source.exists() or not source.is_file():
+            raise RuntimeError(f"Texture file not found: {source.as_posix()}")
+
+        if source.suffix.lower() == ".tex":
+            return source.as_posix(), False
+
+        destination = source.with_suffix(".tex")
+        try:
+            if destination.exists() and destination.stat().st_mtime >= source.stat().st_mtime:
+                return destination.as_posix(), False
+        except Exception:
+            pass
+
+        tool_name, executable = cls.find_converter()
+        if not executable:
+            raise RuntimeError(
+                "Could not find txmake/maketx. Ensure RenderMan is installed and RMANTREE is set."
+            )
+
+        if tool_name == "maketx":
+            cmd = [executable, source.as_posix(), "-o", destination.as_posix()]
+            if raw_channel:
+                cmd += ["--nocolorconvert"]
+            else:
+                cmd += ["--colorconvert", src_colorspace, dst_colorspace]
+                ocio = cls._ocio_config()
+                if ocio:
+                    cmd += ["--ocioconfig", ocio]
+        else:
+            # txmake (RenderMan) — colorspace is managed at render time by
+            # RenderMan's OCIO integration via the PxrTexture node's colorspace
+            # parameter (set by _apply_colorspace). txmake does not accept
+            # OpenImageIO-style --colorconvert flags, so we do a plain conversion.
+            cmd = [executable, source.as_posix(), destination.as_posix()]
+
+        try:
+            cls._run_converter(cmd)
+        except RuntimeError as exc:
+            raise RuntimeError(
+                f"Failed ACES converting '{source.name}' with {tool_name}: {exc}"
+            ) from exc
+
+        if not destination.exists():
+            raise RuntimeError(
+                f"ACES conversion finished but .tex output was not found: {destination.as_posix()}"
+            )
+
+        return destination.as_posix(), True
+
+    @classmethod
+    def convert_to_tx(cls, source_path):
+        """Convert a texture to .tx (Arnold / OpenImageIO maketx).
+
+        Always uses ``maketx``; txmake cannot produce .tx files.
+        Returns (destination_path, was_converted).
+        """
+        source = Path(str(source_path)).expanduser()
+        if not source.exists() or not source.is_file():
+            raise RuntimeError(f"Texture file not found: {source.as_posix()}")
+
+        if source.suffix.lower() == ".tx":
+            return source.as_posix(), False
+
+        destination = source.with_suffix(".tx")
+        try:
+            if destination.exists() and destination.stat().st_mtime >= source.stat().st_mtime:
+                return destination.as_posix(), False
+        except Exception:
+            pass
+
+        maketx_path = shutil.which("maketx")
+        if not maketx_path:
+            raise RuntimeError(
+                "maketx not found. Install OpenImageIO (oiiotool/maketx) to convert to .tx."
+            )
+
+        cmd = [maketx_path, source.as_posix(), "-o", destination.as_posix()]
+        try:
+            cls._run_converter(cmd)
+        except RuntimeError as exc:
+            raise RuntimeError(
+                f"Failed converting '{source.name}' to .tx with maketx: {exc}"
+            ) from exc
+
+        if not destination.exists():
+            raise RuntimeError(
+                f"Conversion finished but .tx output was not found: {destination.as_posix()}"
+            )
+
+        return destination.as_posix(), True
+
+    @classmethod
+    def convert_to_tx_aces(
+        cls,
+        source_path,
+        raw_channel=False,
+        src_colorspace="sRGB",
+        dst_colorspace="ACES - ACEScg",
+    ):
+        """Convert a texture to .tx with optional ACES colorspace transform.
+
+        Always uses maketx (OpenImageIO). raw_channel skips colorspace conversion.
+        Returns (destination_path, was_converted).
+        """
+        source = Path(str(source_path)).expanduser()
+        if not source.exists() or not source.is_file():
+            raise RuntimeError(f"Texture file not found: {source.as_posix()}")
+
+        if source.suffix.lower() == ".tx":
+            return source.as_posix(), False
+
+        destination = source.with_suffix(".tx")
+        try:
+            if destination.exists() and destination.stat().st_mtime >= source.stat().st_mtime:
+                return destination.as_posix(), False
+        except Exception:
+            pass
+
+        maketx_path = shutil.which("maketx")
+        if not maketx_path:
+            raise RuntimeError(
+                "maketx not found. Install OpenImageIO (oiiotool/maketx) to convert to .tx."
+            )
+
+        cmd = [maketx_path, source.as_posix(), "-o", destination.as_posix()]
+        if raw_channel:
+            cmd += ["--nocolorconvert"]
+        else:
+            cmd += ["--colorconvert", src_colorspace, dst_colorspace]
+            ocio = cls._ocio_config()
+            if ocio:
+                cmd += ["--ocioconfig", ocio]
+
+        try:
+            cls._run_converter(cmd)
+        except RuntimeError as exc:
+            raise RuntimeError(
+                f"Failed ACES converting '{source.name}' to .tx with maketx: {exc}"
+            ) from exc
+
+        if not destination.exists():
+            raise RuntimeError(
+                f"ACES conversion finished but .tx output was not found: {destination.as_posix()}"
             )
 
         return destination.as_posix(), True
@@ -235,10 +423,28 @@ class MaterialChannelLibrary:
 
         best_match = None
         best_alias_len = -1
+        best_token_idx = -1  # rightmost position wins; channel suffix is always at the end
 
         for alias, channel in cls._alias_to_channel.items():
             alias_len = len(alias)
-            if alias in tokens or alias.replace("_", "") in normalized_stem:
+            alias_clean = alias.replace("_", "")
+
+            # Find the rightmost token that matches this alias.
+            token_idx = -1
+            for i, token in enumerate(tokens):
+                if token == alias or token == alias_clean:
+                    token_idx = i  # keep updating — we want the rightmost hit
+
+            if token_idx >= 0:
+                # A direct token match: prefer rightmost position, break ties by alias length.
+                if token_idx > best_token_idx or (
+                    token_idx == best_token_idx and alias_len > best_alias_len
+                ):
+                    best_token_idx = token_idx
+                    best_alias_len = alias_len
+                    best_match = channel
+            elif best_token_idx < 0 and alias_clean in normalized_stem:
+                # Normalised-stem fallback only when no direct token match found at all.
                 if alias_len > best_alias_len:
                     best_alias_len = alias_len
                     best_match = channel
@@ -392,7 +598,7 @@ class MaterialChannelLibrary:
                 continue
             if re.fullmatch(r"v\d+", lowered):  # v001 style
                 continue
-            if lowered in {"tex", "texture", "map", "udim"}:
+            if lowered in {"tex", "texture", "map", "udim", "gl", "ogl"}:
                 continue
 
             cleaned.append(token)
@@ -438,9 +644,10 @@ class MaterialBuilder:
     MATERIALX = "materialx"
     PXR = "pxr"
 
-    def __init__(self, material_name, use_udim=False, builder_type=MATERIALX):
+    def __init__(self, material_name, use_udim=False, builder_type=MATERIALX, use_aces=False):
         self.material_name = self._sanitize_name(material_name)
         self.use_udim = bool(use_udim)
+        self.use_aces = bool(use_aces)
         self.builder_type = self._normalize_builder_type(builder_type)
         self.textures = {}
 
@@ -1055,17 +1262,40 @@ class MaterialBuilder:
         return connected
 
     @staticmethod
-    def _set_raw_colorspace(tex_node):
-        for parm_name in ("colorspace", "filecolorspace"):
+    def _try_set_colorspace_parm(parm, value):
+        """Set a colorspace parm by token string or menu index (handles ordinal menus).
+
+        PxrTexture uses an ordinal (integer) menu, so parm.set(string) raises.
+        We fall back to scanning menuItems() and setting by index.
+        Returns True if the value was applied.
+        """
+        # Try direct string assignment (works for string-menu parms like mtlximage)
+        try:
+            parm.set(value)
+            return True
+        except Exception:
+            pass
+        # Fall back: find the token index in the menu and set by integer
+        try:
+            items = parm.menuItems()
+            for i, token in enumerate(items):
+                if token.lower() == value.lower():
+                    parm.set(i)
+                    return True
+        except Exception:
+            pass
+        return False
+
+    @classmethod
+    def _set_raw_colorspace(cls, tex_node):
+        for parm_name in ("filename_colorspace", "colorspace", "filecolorspace"):
             parm = tex_node.parm(parm_name)
             if parm is None:
                 continue
-            for raw_value in ("raw", "Raw", "Utility - Raw"):
-                try:
-                    parm.set(raw_value)
+            # PxrTexture 3.x token first, then OCIO/MaterialX fallbacks
+            for raw_value in ("data", "raw", "Raw", "Utility - Raw", "linear"):
+                if cls._try_set_colorspace_parm(parm, raw_value):
                     return
-                except Exception:
-                    continue
 
     @staticmethod
     def _set_first_available_parm(node, parm_names, value):
@@ -1128,6 +1358,37 @@ class MaterialBuilder:
             return self._create_pxr_texture_node(parent, channel_name, texture_path)
         return self._create_materialx_texture_node(parent, channel_name, texture_path)
 
+    # ACES colorspace strings for color map inputs on MaterialX image nodes.
+    _ACES_COLOR_COLORSPACE = "ACES - ACEScg"
+    # Candidates for the raw (data) colorspace parm value.
+    # PxrTexture 3.x uses "data"; OCIO configs use "raw" / "Utility - Raw".
+    _RAW_COLORSPACE_VALUES = ("data", "raw", "Raw", "Utility - Raw", "linear")
+    # Candidates for the ACES working-space colorspace parm value.
+    # PxrTexture 3.x uses "rendering"; OCIO configs use "ACES - ACEScg".
+    _ACES_COLORSPACE_VALUES = ("rendering", "ACES - ACEScg", "acescg", "ACEScg")
+    # Candidates for sRGB color maps (non-ACES mode).
+    # PxrTexture 3.x uses "srgb_texture".
+    _SRGB_COLORSPACE_VALUES = ("srgb_texture", "sRGB", "srgb", "Utility - sRGB - Texture")
+
+    def _apply_colorspace(self, tex_node, channel_name):
+        """Set the appropriate colorspace on *tex_node* based on channel type and ACES mode."""
+        channel = MaterialChannelLibrary.channel(channel_name)
+        is_raw = channel.raw_colorspace if channel else True
+
+        if is_raw:
+            # Data maps (roughness, normal, metalness, AO, etc.) → data / raw
+            self._set_raw_colorspace(tex_node)
+        else:
+            # Color maps (base color, emission, specular…)
+            candidates = self._ACES_COLORSPACE_VALUES if self.use_aces else self._SRGB_COLORSPACE_VALUES
+            for parm_name in ("filename_colorspace", "colorspace", "filecolorspace"):
+                parm = tex_node.parm(parm_name)
+                if parm is None:
+                    continue
+                for value in candidates:
+                    if self._try_set_colorspace_parm(parm, value):
+                        return
+
     def _create_materialx_texture_node(self, parent, channel_name, texture_path):
         tex_node = self._create_node_with_fallback(
             parent,
@@ -1146,12 +1407,28 @@ class MaterialBuilder:
                 )
             )
         self._set_node_color(tex_node, channel_name)
-
-        channel = MaterialChannelLibrary.channel(channel_name)
-        if channel and channel.raw_colorspace:
-            self._set_raw_colorspace(tex_node)
-
+        self._apply_colorspace(tex_node, channel_name)
         return tex_node
+
+    # Channels that should have Linearize enabled when reading gamma-encoded files.
+    _LINEARIZE_CHANNELS = frozenset(("base_color", "emission_color"))
+    # Formats stored in gamma/sRGB space that benefit from linearization at read time.
+    _LINEARIZE_EXTENSIONS = frozenset((".jpg", ".jpeg", ".png", ".tex"))
+
+    def _apply_linearize(self, tex_node, channel_name, texture_path):
+        """Enable the Linearize checkbox on *tex_node* for color channels
+        read from gamma-encoded image formats (.jpg / .png)."""
+        if channel_name not in self._LINEARIZE_CHANNELS:
+            return
+        ext = Path(str(texture_path)).suffix.lower()
+        if ext not in self._LINEARIZE_EXTENSIONS:
+            return
+        parm = tex_node.parm("linearize")
+        if parm is not None:
+            try:
+                parm.set(1)
+            except Exception:
+                pass
 
     def _create_pxr_texture_node(self, parent, channel_name, texture_path):
         tex_node = self._create_node_with_fallback(
@@ -1171,11 +1448,8 @@ class MaterialBuilder:
                 )
             )
         self._set_node_color(tex_node, channel_name)
-
-        channel = MaterialChannelLibrary.channel(channel_name)
-        if channel and channel.raw_colorspace:
-            self._set_raw_colorspace(tex_node)
-
+        self._apply_colorspace(tex_node, channel_name)
+        self._apply_linearize(tex_node, channel_name, texture_path)
         return tex_node
 
     def _create_pxr_to_float(self, parent, node_name, source_node):
@@ -1189,6 +1463,60 @@ class MaterialBuilder:
         except Exception:
             to_float.setInput(0, source_node, 0)
         return to_float
+
+    @classmethod
+    def _create_pxr_tile_manifold(cls, parent):
+        """Create a single PxrTileManifold node to drive all PXR texture nodes."""
+        return cls._try_create_node_with_fallback(
+            parent,
+            "tile_manifold",
+            ("pxrtilemanifold",),
+        )
+
+    @classmethod
+    def _connect_manifold_to_all_textures(cls, parent, manifold_node):
+        """Wire manifold_node.result -> manifold input of every PxrTexture child."""
+        if manifold_node is None:
+            return
+        for child in parent.children():
+            try:
+                base_type = cls._node_type_base_name(child.type().name()).lower()
+            except Exception:
+                continue
+            if "pxrtexture" not in base_type:
+                continue
+
+            # Resolve the actual index of the 'manifold' input on this node.
+            # We MUST check this first — setNamedInput on VOP nodes does NOT
+            # raise for unknown input names; it silently connects to index 0
+            # and would clobber existing shader-facing connections.
+            manifold_idx = -1
+            try:
+                manifold_idx = child.inputIndex("manifold")
+            except Exception:
+                pass
+
+            if manifold_idx < 0:
+                # Try iterating the input names list as a fallback
+                try:
+                    for i, iname in enumerate(child.inputNames()):
+                        if "manifold" in iname.lower():
+                            manifold_idx = i
+                            break
+                except Exception:
+                    pass
+
+            if manifold_idx < 0:
+                continue
+
+            # Connect using the resolved index so we never touch the wrong slot.
+            for out_name in ("result", "resultS", "out"):
+                try:
+                    child.setInput(manifold_idx, manifold_node, 0)
+                    break
+                except Exception:
+                    continue
+
 
     @classmethod
     def _connect_to_pxr_normal_input(cls, normal_map_node, texture_node):
@@ -1309,7 +1637,7 @@ class MaterialBuilder:
             displacement.setInput(0, displacement_tex)
             scale_parm = displacement.parm("scale")
             if scale_parm:
-                scale_parm.set(0.05)
+                scale_parm.set(0.001)
             self._connect_output(displacement_output, displacement)
 
         opacity_path = self.textures.get("opacity")
@@ -1352,9 +1680,131 @@ class MaterialBuilder:
             subsurface_tex = self._create_texture_node(parent, "subsurface", subsurface_path)
             self._connect_shader_input(shader, subsurface_tex, ("subsurface",))
 
-    def _connect_textures_pxr(self, parent, shader, displacement_output):
-        self._connect_base_and_ao_pxr(parent, shader)
+    def _create_pxr_metallic_workflow(self, parent, base_tex, metalness_to_float, specular_tex, shader):
+        """Create a PxrMetallicWorkflow node and wire it into the surface shader.
 
+        Inputs (specular is optional):
+          baseColor ← base_color texture (RGB)
+          metallic  ← metalness_to_float (scalar)
+          specular  ← specular texture (RGB, optional)
+
+        Outputs wired to PxrSurface:
+          resultDiffuse           → diffuseColor
+          resultSpecularEdgeColor → specularEdgeColor
+          resultSpecularFaceColor → specularFaceColor
+        """
+        metallic_workflow = self._try_create_node_with_fallback(
+            parent,
+            "pxrmetallicworkflow1",
+            ("pxrmetallicworkflow",),
+        )
+        if metallic_workflow is None:
+            return False
+
+        def _resolve_input_idx(node, name):
+            """Return the index of a named input, or -1 if not found."""
+            try:
+                idx = node.inputIndex(name)
+                if idx >= 0:
+                    return idx
+            except Exception:
+                pass
+            # scan input names as fallback
+            try:
+                for i, iname in enumerate(node.inputNames()):
+                    if name.lower() == iname.lower():
+                        return i
+            except Exception:
+                pass
+            return -1
+
+        def _resolve_output_idx(node, name, positional_fallback):
+            """Return the index of a named output, or positional_fallback."""
+            try:
+                idx = node.outputIndex(name)
+                if idx >= 0:
+                    return idx
+            except Exception:
+                pass
+            try:
+                for i, oname in enumerate(node.outputNames()):
+                    if name.lower() == oname.lower():
+                        return i
+            except Exception:
+                pass
+            return positional_fallback
+
+        def _wire_to_workflow(wf_input_name, source_node, out_candidates):
+            """Connect source_node → metallic_workflow input by resolved index."""
+            if source_node is None:
+                return
+            idx = _resolve_input_idx(metallic_workflow, wf_input_name)
+            if idx < 0:
+                return
+            for out_name in out_candidates:
+                out_idx = _resolve_output_idx(source_node, out_name, -1)
+                if out_idx < 0:
+                    continue
+                try:
+                    metallic_workflow.setInput(idx, source_node, out_idx)
+                    return
+                except Exception:
+                    continue
+            # last resort: connect output 0
+            try:
+                metallic_workflow.setInput(idx, source_node, 0)
+            except Exception:
+                pass
+
+        # ── Wire inputs into the workflow ─────────────────────────────────────
+        _wire_to_workflow("baseColor", base_tex,            ("resultRGB", "result", "out"))
+        _wire_to_workflow("metallic",  metalness_to_float,  ("resultF",   "result", "out"))
+        _wire_to_workflow("specular",  specular_tex,        ("resultRGB", "result", "out"))
+
+        # ── Wire workflow outputs → PxrSurface inputs ─────────────────────────
+        # (wf_output_name, positional_fallback_index, shader_input_name)
+        _output_map = (
+            ("resultDiffuse",           0, "diffuseColor"),
+            ("resultSpecularEdgeColor", 1, "specularEdgeColor"),
+            ("resultSpecularFaceColor", 2, "specularFaceColor"),
+        )
+        for wf_out_name, wf_out_fallback, shader_in_name in _output_map:
+            wf_out_idx  = _resolve_output_idx(metallic_workflow, wf_out_name, wf_out_fallback)
+            shader_in_idx = _resolve_input_idx(shader, shader_in_name)
+            if shader_in_idx < 0:
+                continue
+            try:
+                shader.setInput(shader_in_idx, metallic_workflow, wf_out_idx)
+            except Exception:
+                pass
+
+        return True
+
+    def _connect_textures_pxr(self, parent, shader, displacement_output):
+        # Create a single tile manifold that will drive UV tiling for all textures.
+        manifold = self._create_pxr_tile_manifold(parent)
+
+        metalness_path = self.textures.get("metalness")
+
+        # ── Base colour / AO ──────────────────────────────────────────────────
+        # When a metalness texture is present we delay wiring base_color into
+        # the surface shader; it will be fed through PxrMetallicWorkflow instead.
+        base_path = self.textures.get("base_color")
+        base_tex = None
+        if base_path:
+            base_tex = self._create_texture_node(parent, "base_color", base_path)
+
+        ao_path = self.textures.get("ao")
+        if ao_path:
+            ao_tex = self._create_texture_node(parent, "ao", ao_path)
+            self._connect_shader_input(
+                shader,
+                ao_tex,
+                ("ambientOcclusion", "occlusion", "ao"),
+                ("ambientocclusion", "occlusion", "ao"),
+            )
+
+        # ── Roughness / Glossiness ────────────────────────────────────────────
         roughness_path = self.textures.get("roughness")
         if roughness_path:
             roughness_tex = self._create_texture_node(parent, "roughness", roughness_path)
@@ -1396,16 +1846,47 @@ class MaterialBuilder:
                     ("roughness", "specularroughness"),
                 )
 
-        metalness_path = self.textures.get("metalness")
+        # ── Metalness / PxrMetallicWorkflow ───────────────────────────────────
         if metalness_path:
             metalness_tex = self._create_texture_node(parent, "metalness", metalness_path)
             metalness_to_float = self._create_pxr_to_float(parent, "metalness_to_float", metalness_tex)
-            self._connect_shader_input(
-                shader,
-                metalness_to_float,
-                ("metalness", "metallic"),
-                ("metalness", "metallic"),
+
+            # Specular texture is consumed by the workflow node (optional).
+            specular_tex_for_workflow = None
+            specular_path_wf = self.textures.get("specular")
+            if specular_path_wf:
+                specular_tex_for_workflow = self._create_texture_node(
+                    parent, "specular", specular_path_wf
+                )
+
+            used_workflow = self._create_pxr_metallic_workflow(
+                parent, base_tex, metalness_to_float, specular_tex_for_workflow, shader
             )
+
+            if not used_workflow:
+                # Fallback: connect directly without the workflow node.
+                if base_tex is not None:
+                    self._connect_shader_input(
+                        shader,
+                        base_tex,
+                        ("baseColor", "base_color", "diffuseColor"),
+                        ("basecolor", "diffusecolor"),
+                    )
+                self._connect_shader_input(
+                    shader,
+                    metalness_to_float,
+                    ("metalness", "metallic"),
+                    ("metalness", "metallic"),
+                )
+        else:
+            # No metalness — connect base_color directly (legacy path).
+            if base_tex is not None:
+                self._connect_shader_input(
+                    shader,
+                    base_tex,
+                    ("baseColor", "base_color", "diffuseColor"),
+                    ("basecolor", "diffusecolor"),
+                )
 
         normal_path = self.textures.get("normal")
         if normal_path:
@@ -1460,7 +1941,7 @@ class MaterialBuilder:
                 self._set_first_available_parm(
                     displacement_node,
                     ("dispAmount", "displacementAmount", "scale", "amount"),
-                    0.05,
+                    0.001,
                 )
                 displacement_source = displacement_node
             if displacement_output is not None:
@@ -1499,7 +1980,9 @@ class MaterialBuilder:
             )
 
         specular_path = self.textures.get("specular")
-        if specular_path:
+        # Specular is consumed by PxrMetallicWorkflow when metalness is present.
+        # Only wire it standalone when there is no metalness texture.
+        if specular_path and not metalness_path:
             specular_tex = self._create_texture_node(parent, "specular", specular_path)
             self._connect_shader_input(
                 shader,
@@ -1537,6 +2020,9 @@ class MaterialBuilder:
                 ("subsurfaceColor", "subsurface"),
                 ("subsurfacecolor", "subsurface"),
             )
+
+        # Wire the tile manifold to every PxrTexture node in the subnet.
+        self._connect_manifold_to_all_textures(parent, manifold)
 
 
 def show_ui(parent=None):
@@ -1604,7 +2090,7 @@ def show_ui(parent=None):
             self._apply_style()
             self._on_mode_toggled(self.auto_detect_check.isChecked())
             self._on_auto_name_toggled(self.auto_name_check.isChecked())
-            self._update_create_button_text()
+            self._on_builder_type_changed(0)  # sets create-button text for initial builder type
             self._update_summary({})
             self._set_info("Ready.", "info")
 
@@ -1650,9 +2136,24 @@ def show_ui(parent=None):
             self.udim_check = QtWidgets.QCheckBox("Convert Texture to <UDIM>")
             self.udim_check.setChecked(False)
 
+            self.aces_check = QtWidgets.QCheckBox("ACES Colorspace")
+            self.aces_check.setChecked(False)
+            self.aces_check.setToolTip(
+                "Apply ACES colorspace to color maps (base color, emission).\n"
+                "Data maps (roughness, normal, etc.) are always kept raw.\n"
+                "When converting to TEX, bakes the colorspace transform into the file."
+            )
+
             self.auto_detect_check = QtWidgets.QCheckBox("Auto detect textures from selected files")
             self.auto_detect_check.setChecked(True)
             self.auto_detect_check.toggled.connect(self._on_mode_toggled)
+
+            self.auto_convert_check = QtWidgets.QCheckBox("Auto-convert textures")
+            self.auto_convert_check.setChecked(True)
+            self.auto_convert_check.setToolTip(
+                "Automatically convert textures to the chosen format\n"
+                "(derived from Builder Type) before creating the material."
+            )
 
             toggles_row = QtWidgets.QHBoxLayout()
             toggles_row.setContentsMargins(0, 0, 0, 0)
@@ -1660,7 +2161,9 @@ def show_ui(parent=None):
             toggles_row.addStretch(1)
             toggles_row.addWidget(self.auto_name_check)
             toggles_row.addWidget(self.udim_check)
+            toggles_row.addWidget(self.aces_check)
             toggles_row.addWidget(self.auto_detect_check)
+            toggles_row.addWidget(self.auto_convert_check)
             toggles_row.addStretch(1)
             settings_layout.addLayout(toggles_row, 2, 0, 1, 4)
 
@@ -1687,10 +2190,6 @@ def show_ui(parent=None):
             self.preview_btn = QtWidgets.QPushButton("Preview")
             self.preview_btn.clicked.connect(self._preview_textures)
             buttons_layout.addWidget(self.preview_btn)
-
-            self.convert_btn = QtWidgets.QPushButton("Convert Textures to .tex")
-            self.convert_btn.clicked.connect(self._convert_textures_to_tex)
-            buttons_layout.addWidget(self.convert_btn)
 
             self.create_btn = QtWidgets.QPushButton("Create Material in LOPs")
             self.create_btn.clicked.connect(self._create_material)
@@ -1852,6 +2351,10 @@ def show_ui(parent=None):
         def _on_builder_type_changed(self, _index):
             self._update_create_button_text()
 
+        def _selected_tex_format(self):
+            """Return '.tex' for PXR/RenderMan, '.tx' for MaterialX/Arnold."""
+            return ".tex" if self._selected_builder_type() == "pxr" else ".tx"
+
         def _update_create_button_text(self):
             self.create_btn.setText("Create {0} in LOPs".format(self._selected_builder_label()))
 
@@ -1915,8 +2418,22 @@ def show_ui(parent=None):
                     )
                     return
 
+                target_format = self._selected_tex_format()
+                use_tx = target_format == ".tx"
+
                 tool_name, _tool_path = TextureConverter.find_converter()
-                if not tool_name:
+                if use_tx:
+                    # .tx always needs maketx; check for it specifically
+                    import shutil as _shutil
+                    if not _shutil.which("maketx"):
+                        self._set_progress(1, 1, "maketx not found")
+                        self._set_info(
+                            "maketx not found. Install OpenImageIO to convert to .tx.",
+                            "error",
+                        )
+                        return
+                    tool_name = "maketx"
+                elif not tool_name:
                     self._set_progress(1, 1, "Converter not found")
                     self._set_info(
                         "txmake/maketx not found. Ensure RenderMan is installed and RMANTREE is set.",
@@ -1939,7 +2456,37 @@ def show_ui(parent=None):
                         "Converting {0}/{1}: {2}".format(index - 1, total, label),
                     )
                     try:
-                        converted_path, changed = TextureConverter.convert_to_tex(source_path)
+                        channel_name = None
+                        for grp in self._collect_auto_material_groups():
+                            for ch, tp in grp["textures"].items():
+                                if self._normalize_texture_path(tp) == self._normalize_texture_path(source_path):
+                                    channel_name = ch
+                                    break
+                            if channel_name:
+                                break
+                        if channel_name is None:
+                            for ch, tp in self._collect_manual_textures().items():
+                                if self._normalize_texture_path(tp) == self._normalize_texture_path(source_path):
+                                    channel_name = ch
+                                    break
+                        raw_ch = True
+                        if channel_name:
+                            ch_obj = MaterialChannelLibrary.channel(channel_name)
+                            raw_ch = ch_obj.raw_colorspace if ch_obj else True
+                        if use_tx:
+                            if self.aces_check.isChecked():
+                                converted_path, changed = TextureConverter.convert_to_tx_aces(
+                                    source_path, raw_channel=raw_ch
+                                )
+                            else:
+                                converted_path, changed = TextureConverter.convert_to_tx(source_path)
+                        else:
+                            if self.aces_check.isChecked():
+                                converted_path, changed = TextureConverter.convert_to_tex_aces(
+                                    source_path, raw_channel=raw_ch
+                                )
+                            else:
+                                converted_path, changed = TextureConverter.convert_to_tex(source_path)
                         source_norm = self._normalize_texture_path(source_path)
                         converted_norm = self._normalize_texture_path(converted_path)
                         self._converted_texture_paths[source_norm] = converted_norm
@@ -2257,7 +2804,6 @@ def show_ui(parent=None):
         def _set_busy(self, is_busy):
             self.create_btn.setEnabled(not is_busy)
             self.preview_btn.setEnabled(not is_busy)
-            self.convert_btn.setEnabled(not is_busy)
             self.reset_btn.setEnabled(not is_busy)
             if is_busy:
                 self.setCursor(QtCore.Qt.WaitCursor)
@@ -2304,6 +2850,13 @@ def show_ui(parent=None):
         def _create_material(self):
             self._set_busy(True)
             try:
+                # ── Auto-convert textures if the toggle is on ──────────────────
+                if self.auto_convert_check.isChecked():
+                    self._convert_textures_to_tex()
+                    # _convert_textures_to_tex sets busy=False at the end;
+                    # re-acquire busy state for the build step.
+                    self._set_busy(True)
+
                 builder_type = self._selected_builder_type()
                 if self.auto_detect_check.isChecked():
                     groups = self._collect_auto_material_groups()
@@ -2348,6 +2901,7 @@ def show_ui(parent=None):
                             material_name=material_name,
                             use_udim=self.udim_check.isChecked(),
                             builder_type=builder_type,
+                            use_aces=self.aces_check.isChecked(),
                         )
                         for channel_name, texture_path in group["textures"].items():
                             builder.add_texture(
@@ -2428,6 +2982,7 @@ def show_ui(parent=None):
                     material_name=material_name,
                     use_udim=self.udim_check.isChecked(),
                     builder_type=builder_type,
+                    use_aces=self.aces_check.isChecked(),
                 )
                 for channel_name, texture_path in textures.items():
                     builder.add_texture(

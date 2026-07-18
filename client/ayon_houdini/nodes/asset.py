@@ -61,7 +61,7 @@ def _get_asset_folder(project_name, category, asset_value):
 
 
 def _get_task_products(project_name, folder_id, task_name):
-    """Return products matching the given task by name keywords."""
+    """Return products matching the given task by name keywords or product type."""
     task_name = (task_name or "").lower()
     keywords = TASK_PRODUCT_KEYWORDS.get(task_name, [])
     if not keywords and task_name:
@@ -79,7 +79,16 @@ def _get_task_products(project_name, folder_id, task_name):
         name_l = product["name"].lower()
         if name_l.startswith("workfile"):
             continue
-        if keywords and any(keyword in name_l for keyword in keywords):
+        if not keywords:
+            task_products.append(product)
+            continue
+        # Match by product name keywords OR product type
+        # e.g. product named "props_bldg_lg_f" with productType="model"
+        # should still match the "modeling" task (keyword "model")
+        product_type = (product.get("productType") or "").lower()
+        if any(keyword in name_l for keyword in keywords) or any(
+            keyword in product_type for keyword in keywords
+        ):
             task_products.append(product)
 
     return task_products
@@ -353,7 +362,11 @@ def list_versions_for_asset(category, asset_name, task_name):
     versions = get_versions_for_asset(category, asset_name, task_name)
     version_tokens = [f"v{version:03d}" for version in versions]
 
-    _CACHE_VERSIONS[cache_key] = version_tokens
+    # Only cache non-empty results — an empty list from an early call
+    # (e.g. before department parm is resolved) must not permanently
+    # block future valid queries for the same key.
+    if version_tokens:
+        _CACHE_VERSIONS[cache_key] = version_tokens
     return version_tokens[:]
 
 
