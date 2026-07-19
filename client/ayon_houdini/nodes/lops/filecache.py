@@ -523,19 +523,344 @@ def write_cache(node):
         #  Always clear after render
         _FROZEN_WRITE_VERSION = None
 
+def _count_prims_under(stage, root_path):
+    """
+    Count the total number of prims under *root_path* in *stage*
+    (including root itself).  Used as a proxy for geometry completeness:
+    a frame with more prims has a more complete hierarchy (more parts, LODs,
+    etc.) and is therefore a better topology source.
+
+    Cheap — never reads attribute values, only traverses prim metadata.
+    """
+    from pxr import Usd
+    root_prim = stage.GetPrimAtPath(root_path)
+    if not root_prim or not root_prim.IsValid():
+        return 0
+    return sum(1 for _ in Usd.PrimRange(root_prim))
+
+
+#: How many evenly-spaced frames to open when searching for the topology frame.
+#: Higher = more accurate but slower wrapper creation.
+_TOPO_SAMPLE_COUNT = 10
+
+
+def _find_topology_frame(ver_dir, seq_candidates):
+    """
+    Return ``(clip_name, root_path, root_type)`` for the frame in
+    *seq_candidates* that has the **most complete prim hierarchy**.
+
+    Why "most prims" instead of "first non-empty"?
+    -----------------------------------------------
+    For a prop with multiple geometry layers (inside, outside, cork, pipe)
+    the very first frame might only have *one* layer authored (e.g. only
+    ``outside`` exists on frame 1001) while the rest appear on later frames.
+    Referencing that first frame as the topology source means the wrapper
+    stage never knows about the missing prims — they simply don't exist in
+    the composed stage regardless of what the clip files contain.
+
+    By sampling frames across the full range and choosing the one with the
+    highest prim count, we capture the most complete geometry description:
+
+    - **FX / particles**: early frames have 0 prims (nothing born yet),
+      later frames have the full point cloud → later frame wins.
+    - **Props / characters**: all frames should have all parts, but some
+      parts may only be authored on certain frames → the most complete
+      frame wins.
+
+    Sampling strategy
+    -----------------
+    Opens at most ``_TOPO_SAMPLE_COUNT`` frames, evenly spaced across the
+    sequence (always including the first and last).  If the sequence is
+    shorter than the sample count, every frame is checked.
+
+    Falls back to the very first readable frame if nothing has any prims.
+    """
+    from pxr import Usd
+
+    if not seq_candidates:
+        return None, None, None
+
+    total = len(seq_candidates)
+    if total <= _TOPO_SAMPLE_COUNT:
+        sample = seq_candidates
+    else:
+        # Evenly spaced, always include index 0 and index total-1.
+        indices = set()
+        indices.add(0)
+        indices.add(total - 1)
+        for k in range(1, _TOPO_SAMPLE_COUNT - 1):
+            idx = int(round(k * (total - 1) / (_TOPO_SAMPLE_COUNT - 1)))
+            indices.add(idx)
+        sample = [seq_candidates[i] for i in sorted(indices)]
+
+    # best = (prim_count, frame_num, clip_name, root_path, root_type)
+    best = None
+    fallback = None  # first readable frame, regardless of prim count
+
+    for item in sample:
+        _, frame_num, frame_str, clip_base, clip_ext, clip_name = item
+        clip_path = os.path.join(ver_dir, clip_name).replace("\\", "/")
+
+        stage = Usd.Stage.Open(clip_path)
+        if not stage:
+            continue
+
+        # Determine root prim path and type.
+        default_prim = stage.GetDefaultPrim()
+        if default_prim and default_prim.IsValid():
+            root_path = default_prim.GetPath().pathString
+            root_type = default_prim.GetTypeName() or "Xform"
+        else:
+            roots = stage.GetPseudoRoot().GetChildren()
+            if not roots:
+                del stage
+                continue
+            root_path = roots[0].GetPath().pathString
+            root_type = roots[0].GetTypeName() or "Xform"
+
+        if fallback is None:
+            fallback = (clip_name, root_path, root_type)
+
+        prim_count = _count_prims_under(stage, root_path)
+        del stage
+
+        if best is None or prim_count > best[0]:
+            best = (prim_count, frame_num, clip_name, root_path, root_type)
+
+    if best and best[0] > 0:
+        prim_count, frame_num, clip_name, root_path, root_type = best
+        _LOGGER.info(
+            "[USD] Topology frame: %s (frame %s) — %d prims (most complete in sample).",
+            clip_name, frame_num, prim_count,
+        )
+        return clip_name, root_path, root_type
+
+    if fallback:
+        _LOGGER.warning(
+            "[USD] No frame with geometry prims found in %s; "
+            "using first readable frame as topology source.",
+            ver_dir,
+        )
+        return fallback
+
+    return None, None, None
+
+
+def _sanitize_usd_prim_name(name):
+    """
+    Convert an arbitrary string into a valid USD prim name.
+    USD prim names must match [A-Za-z_][A-Za-z0-9_]*.
+    """
+    sanitized = re.sub(r"[^A-Za-z0-9_]", "_", name)
+    if sanitized and sanitized[0].isdigit():
+        sanitized = "_" + sanitized
+    return sanitized or "fx_cache"
+
+
+def _unwrap_container_prim(stage, root_path):
+    """
+    Unwrap only known export containers such as /Geometry.
+
+    Do NOT unwrap scene roots like /World.
+    """
+    from pxr import Usd
+
+    # Only these roots are allowed to be removed.
+    UNWRAPPABLE_ROOTS = {
+        "/Geometry",
+        "/ROOT",
+        "/Root",
+    }
+
+    if root_path not in UNWRAPPABLE_ROOTS:
+        return root_path, None
+
+    prim = stage.GetPrimAtPath(root_path)
+    if not (prim and prim.IsValid()):
+        return root_path, None
+
+    if prim.GetTypeName() not in ("", "Xform", "Scope"):
+        return root_path, None
+
+    if prim.GetAuthoredAttributes():
+        return root_path, None
+
+    children = prim.GetChildren()
+    if len(children) != 1:
+        return root_path, None
+
+    child = children[0]
+    return child.GetPath().pathString, child.GetTypeName() or "Xform"
+
+
+def _should_preserve_shallow_root_path(root_path, stage=None):
+    """
+    Keep meaningful shallow scene roots like ``/World`` intact.
+
+    Generic cache export roots like ``/Geometry`` should still be remapped to
+    a node-name wrapper so stacked caches do not collide on ClipsAPI metadata.
+    """
+    parts = [part for part in root_path.strip("/").split("/") if part]
+    if len(parts) != 1:
+        return False
+
+    root_name = parts[0]
+    if root_name.lower() in {"geometry", "geo"}:
+        return False
+
+    if stage is not None:
+        prim = stage.GetPrimAtPath(root_path)
+        if prim and prim.IsValid():
+            if prim.GetChildren():
+                return True
+            if prim.GetAuthoredAttributes():
+                return True
+
+    return True
+
+
+def _resolve_wrapper_prim_path(clip_root_path, node_name, topo_stage=None, node=None):
+    """
+    Determine how the master wrapper should map the clip hierarchy into the
+    composed stage.
+
+    Returns
+    -------
+    wrapper_prim_path : str
+        Where to define the root prim inside ``master.usdc``.
+    default_prim_name : str
+        Root component of ``wrapper_prim_path`` for ``stage.SetDefaultPrim()``.
+    clip_ref_path : str
+        Path **inside the clip file** to use for ``AddReference()``  — gives
+        the prim its schema/type/children (topology).
+    clip_anim_path : str
+        Path **inside each frame file** to set as ``SetClipPrimPath()`` —
+        tells USD where to read time-sampled attribute values from.
+
+    Priority order
+    --------------
+    1. Explicit node parameter (``usd_scene_path`` / ``primpath`` / etc.).
+    2. Deep clip path (> 1 component) — already unique; preserved as-is.
+    3. Unwrapped shallow container — strips the container prefix so the scene
+       hierarchy is preserved without double-nesting.
+    4. Preserve meaningful shallow scene roots like ``/World``.
+    5. Node-name fallback — renames generic roots like ``/Geometry`` to
+       ``/{node_name}`` to prevent ClipsAPI collision when multiple FX caches
+       are sublayered.
+
+    Unwrap example
+    --------------
+    Clip files export with ``/Geometry`` as defaultPrim, but inside is::
+
+        /Geometry          <- empty Xform container (clip_root_path)
+          /Geometry/World  <- sole child (inner_abs_path)
+            /Shot/fx/droplets/Droplet_G
+
+    Result::
+
+        wrapper_prim_path = "/World"             (inner suffix, strip /Geometry)
+        clip_ref_path     = "/Geometry/World"    (AddReference target in clip)
+        clip_anim_path    = "/Geometry/World"    (SetClipPrimPath in frames)
+
+    This makes ``master.usdc`` present ``/World/Shot/fx/droplets/Droplet_G``
+    without any double-nesting.
+    """
+    # 1. Explicit override from a node parameter.
+    if node is not None:
+        for parm_name in ("usd_scene_path", "usd_prim_path", "primpath", "rootprim"):
+            p = node.parm(parm_name)
+            if p:
+                val = p.evalAsString().strip()
+                if val and val.startswith("/") and len(val) > 1:
+                    parts = [x for x in val.strip("/").split("/") if x]
+                    # Reference and animate from the original clip root.
+                    return val, parts[0], clip_root_path, clip_root_path
+
+    parts = [p for p in clip_root_path.strip("/").split("/") if p]
+
+    # 2. Deep path — already unique; preserved as-is.
+    if len(parts) > 1:
+        return clip_root_path, parts[0], clip_root_path, clip_root_path
+
+    # 3. Shallow container — try to unwrap.
+    if topo_stage is not None:
+        inner_abs, inner_type = _unwrap_container_prim(topo_stage, clip_root_path)
+        if inner_abs != clip_root_path:
+            # Strip the container prefix to get the scene-correct wrapper path.
+            # e.g.  inner_abs="/Geometry/World"  clip_root_path="/Geometry"
+            #       wrapper = "/World"  (the suffix after the container)
+            wrapper = inner_abs[len(clip_root_path):]  # e.g. "/World"
+            w_parts = [p for p in wrapper.strip("/").split("/") if p]
+            if w_parts:
+                _LOGGER.info(
+                    "[USD] Unwrapped container %s → wrapper=%s  ref/anim=%s",
+                    clip_root_path, wrapper, inner_abs,
+                )
+                # clip_ref_path = clip_anim_path = inner_abs (the ACTUAL path
+                # inside clip files where the prim lives).
+                return wrapper, w_parts[0], inner_abs, inner_abs
+
+    # 4. Preserve meaningful shallow scene roots like /World.
+    if _should_preserve_shallow_root_path(clip_root_path, stage=topo_stage):
+        return clip_root_path, parts[0], clip_root_path, clip_root_path
+
+    # 5. Node-name fallback — rename generic roots to avoid ClipsAPI collision.
+    return f"/{node_name}", node_name, clip_root_path, clip_root_path
+
+
 def create_usd_master_wrapper(node, version=None):
+    """
+    Build a ``master.usdc`` wrapper that is safe to stack with other FX
+    caches via SublayerLOP, ReferenceLOP, or PayloadLOP.
+
+    Multi-FX stacking problem (and fix)
+    ------------------------------------
+    All FX caches written by a SOP Import → USD ROP share the same root prim
+    path (``/Geometry``).  When you sublayer two or more ``master.usdc``
+    files that both define ClipsAPI on ``/Geometry``, USD's composition rules
+    discard every ClipsAPI but the strongest (topmost sublayer).  The other
+    caches appear frozen on their topology frame.
+
+    Fix: the wrapper defines its root prim at ``/{node_name}`` (e.g.
+    ``/droplets_pts``) — unique per node — so each cache lives at a different
+    path in the composed stage and ClipsAPI metadata never collides.
+
+    Topology still comes from the first non-empty clip frame, but via a
+    **Reference arc** (``AddReference``) that maps the clip's ``/Geometry``
+    into ``/{node_name}``.  ``SetClipPrimPath`` still points to ``/Geometry``
+    inside the per-frame files so time-varying attribute values resolve
+    correctly across the full frame range.
+
+    Structure of master.usdc
+    ------------------------
+    ::
+
+        master.usdc
+          defaultPrim = {node_name}
+          startTimeCode / endTimeCode
+          /{node_name}  [type = Points / Geometry / …]
+            Reference → ./sequence.TOPO.usdc @ /Geometry   (topology + schema)
+            ClipsAPI:
+              templateAssetPath  = sequence.####.usdc
+              templateStart/End/Stride
+              clipPrimPath       = /Geometry   ← path INSIDE each clip file
+    """
     if version is None:
         version = active_version(node)
 
-    from pxr import Usd
+    from pxr import Usd, Sdf
+
+    # Node name sanitized for USD — used as fallback prim name for generic paths.
+    node_name = _sanitize_usd_prim_name(node.name())
 
     ver_dir = version_dir(node, version)
     main_path = os.path.join(ver_dir, "master.usdc").replace("\\", "/")
 
     f1, f2 = frame_range(node)
 
-    # Detect rendered clip files from disk so wrapper creation does not fail
-    # when naming/padding differs from the expected tokenized pattern.
+    # ------------------------------------------------------------------
+    # 1. Find clip files on disk
+    # ------------------------------------------------------------------
     seq_rx = re.compile(r"^(sequence|main)\.(\d+)\.(usd|usdc|usda)$")
     single_rx = re.compile(r"^(sequence|main)\.(usd|usdc|usda)$")
     seq_candidates = []
@@ -560,13 +885,41 @@ def create_usd_master_wrapper(node, version=None):
     is_sequence = bool(seq_candidates)
     if is_sequence:
         seq_candidates.sort(key=lambda item: (item[0], item[1]))
-        _, first_frame, first_frame_str, clip_base, clip_ext, first_clip_name = seq_candidates[0]
+        _, first_frame, first_frame_str, clip_base, clip_ext, _ = seq_candidates[0]
         pad = len(first_frame_str)
+
+        # Find the first frame that actually has geometry data.
+        # FX caches often have empty early frames before particles are born.
+        topo_clip_name, clip_root_path, clip_root_type = _find_topology_frame(
+            ver_dir, seq_candidates
+        )
+        if topo_clip_name is None:
+            _LOGGER.error("[USD] No readable clip files found in %s", ver_dir)
+            return None
+
     elif single_candidates:
         single_candidates.sort(key=lambda item: item[0])
-        _, clip_base, clip_ext, first_clip_name = single_candidates[0]
+        _, clip_base, clip_ext, topo_clip_name = single_candidates[0]
         first_frame = f1
         pad = 1
+
+        topo_path_abs = os.path.join(ver_dir, topo_clip_name).replace("\\", "/")
+        clip_stage = Usd.Stage.Open(topo_path_abs)
+        if not clip_stage:
+            _LOGGER.error("[USD] Could not open clip file: %s", topo_path_abs)
+            return None
+        default_prim = clip_stage.GetDefaultPrim()
+        if default_prim and default_prim.IsValid():
+            clip_root_path = default_prim.GetPath().pathString
+            clip_root_type = default_prim.GetTypeName() or "Xform"
+        else:
+            roots = clip_stage.GetPseudoRoot().GetChildren()
+            if not roots:
+                _LOGGER.error("[USD] No root prim in clip: %s", topo_path_abs)
+                return None
+            clip_root_path = roots[0].GetPath().pathString
+            clip_root_type = roots[0].GetTypeName() or "Xform"
+        del clip_stage
     else:
         _LOGGER.error(
             "[USD] No clip files found in %s (expected sequence.*.<usd/usdc/usda>)",
@@ -574,25 +927,32 @@ def create_usd_master_wrapper(node, version=None):
         )
         return None
 
-    first_clip_path = os.path.join(ver_dir, first_clip_name).replace("\\", "/")
+    # ------------------------------------------------------------------
+    # 3. Resolve wrapper prim path
+    # ------------------------------------------------------------------
+    # Open the topology frame (read-only) so the resolver can peek inside
+    # shallow container prims (e.g. /Geometry wrapping /World/Shot/fx/...).
+    topo_path_abs = os.path.join(ver_dir, topo_clip_name).replace("\\", "/")
+    _topo_stage_for_peek = Usd.Stage.Open(topo_path_abs)
 
-    clip_stage = Usd.Stage.Open(first_clip_path)
-    if not clip_stage:
-        _LOGGER.error("[USD] Could not open first clip file: %s", first_clip_path)
-        return None
+    wrapper_prim_path, default_prim_name, clip_ref_path, clip_anim_path = (
+        _resolve_wrapper_prim_path(
+            clip_root_path,
+            node_name,
+            topo_stage=_topo_stage_for_peek,
+            node=node,
+        )
+    )
+    del _topo_stage_for_peek
 
-    default_prim = clip_stage.GetDefaultPrim()
-    if default_prim and default_prim.IsValid():
-        root_path = default_prim.GetPath().pathString
-        root_type = default_prim.GetTypeName() or "Xform"
-    else:
-        roots = clip_stage.GetPseudoRoot().GetChildren()
-        if not roots:
-            _LOGGER.error("[USD] No root prim found in clip: %s", first_clip_path)
-            return None
-        root_path = roots[0].GetPath().pathString
-        root_type = roots[0].GetTypeName() or "Xform"
+    _LOGGER.info(
+        "[USD] clip_root=%s → wrapper=%s  ref=%s  anim=%s",
+        clip_root_path, wrapper_prim_path, clip_ref_path, clip_anim_path,
+    )
 
+    # ------------------------------------------------------------------
+    # 4. Write master.usdc
+    # ------------------------------------------------------------------
     if os.path.exists(main_path):
         try:
             os.remove(main_path)
@@ -600,33 +960,69 @@ def create_usd_master_wrapper(node, version=None):
             pass
 
     stage = Usd.Stage.CreateNew(main_path)
-    root_prim = stage.DefinePrim(root_path, root_type)
-    stage.SetDefaultPrim(root_prim)
     stage.SetStartTimeCode(f1)
     stage.SetEndTimeCode(f2)
 
+    # Define the prim at wrapper_prim_path.
+    # Use effective_type = type of the prim at clip_ref_path (may differ from
+    # clip_root_type when the container was unwrapped).
+    #
+    # For unwrapped paths we open the topo stage again briefly to get the
+    # inner prim's type; for all other cases clip_root_type is correct.
+    effective_type = clip_root_type
+    if clip_ref_path != clip_root_path:
+        _ts = Usd.Stage.Open(topo_path_abs)
+        if _ts:
+            _inner_prim = _ts.GetPrimAtPath(clip_ref_path)
+            if _inner_prim and _inner_prim.IsValid():
+                effective_type = _inner_prim.GetTypeName() or clip_root_type
+            del _ts
+
+    root_prim = stage.DefinePrim(wrapper_prim_path, effective_type)
+
+    # defaultPrim must be a ROOT-level prim (single component).
+    default_prim = stage.GetPrimAtPath("/" + default_prim_name)
+    if default_prim and default_prim.IsValid():
+        stage.SetDefaultPrim(default_prim)
+
+    # Reference the topology frame using clip_ref_path.
+    # For unwrapped paths this points to the INNER prim (e.g. /Geometry/World)
+    # so children like /Shot/fx/droplets appear directly under our wrapper prim
+    # without double-nesting.
+    root_prim.GetReferences().AddReference(
+        f"./{topo_clip_name}",
+        clip_ref_path,
+    )
+
     if is_sequence:
         clips = Usd.ClipsAPI(root_prim)
-        clip_template = f"{clip_base}.{('#' * pad)}.{clip_ext}"
+        clip_template = f"{clip_base}.{'#' * pad}.{clip_ext}"
         clips.SetClipTemplateAssetPath(clip_template)
         clips.SetClipTemplateStartTime(f1)
         clips.SetClipTemplateEndTime(f2)
         clips.SetClipTemplateStride(1.0)
-        clips.SetClipActive([(f1, 0)])
-        clips.SetClipTimes([(f1, f1), (f2, f2)])
-        clips.SetClipPrimPath(root_path)
-
-        # Reference first frame for stable topology/defaults; clips provide time-varying values.
-        root_prim.GetReferences().AddReference(
-            f"./{clip_base}.{str(first_frame).zfill(pad)}.{clip_ext}",
-            root_path
-        )
+        # clip_anim_path = path INSIDE each per-frame file where this prim's
+        # time-sampled attributes live.  For unwrapped paths this is the inner
+        # absolute path (e.g. /Geometry/World), NOT the container root.
+        clips.SetClipPrimPath(clip_anim_path)
     else:
-        # Frameless: just reference the single sequence file directly.
-        root_prim.GetReferences().AddReference(f"./{clip_base}.{clip_ext}", root_path)
+        pass  # Frameless: reference above gives us the static data.
 
     stage.GetRootLayer().Save()
-    _LOGGER.info("[USD] Master wrapper created: %s | ClipPrim: %s", main_path, root_path)
+
+    _LOGGER.info(
+        "[USD] Master wrapper created: %s | wrapperPrim: %s | clipPrimPath: %s | topo: %s",
+        main_path,
+        wrapper_prim_path,
+        clip_anim_path,
+        topo_clip_name,
+    )
+
+
+
+
+
+
 
 def read_version(node):
     if node.parm("read_latest") and node.parm("read_latest").eval():
@@ -789,14 +1185,16 @@ def _resolve_hython_executable():
     return exe_name
 
 
-def _master_wrapper_job_script_source(ver_dir, f1, f2):
+def _master_wrapper_job_script_source(ver_dir, f1, f2, node_name):
     ver_dir_literal = json.dumps(ver_dir.replace("\\", "/"))
+    node_name_literal = json.dumps(node_name)
     return f'''import os
 import re
 import sys
-from pxr import Usd
+from pxr import Usd, Sdf
 
 VER_DIR = {ver_dir_literal}
+NODE_NAME = {node_name_literal}
 F1 = {int(f1)}
 F2 = {int(f2)}
 MAIN_PATH = os.path.join(VER_DIR, "master.usdc").replace("\\\\", "/")
@@ -843,49 +1241,233 @@ def _pick_clip_files():
     )
 
 
-def _clip_root(first_clip_name):
-    first_clip_path = os.path.join(VER_DIR, first_clip_name).replace("\\\\", "/")
-    clip_stage = Usd.Stage.Open(first_clip_path)
+def _count_prims_under(stage, root_path):
+    root_prim = stage.GetPrimAtPath(root_path)
+    if not root_prim or not root_prim.IsValid():
+        return 0
+    return sum(1 for _ in Usd.PrimRange(root_prim))
+
+
+TOPO_SAMPLE_COUNT = 10
+
+
+def _find_topology_frame(seq_candidates):
+    """
+    Return (topo_clip_name, root_path, root_type) for the frame with the
+    most complete prim hierarchy.
+
+    Samples up to TOPO_SAMPLE_COUNT evenly-spaced frames and picks the one
+    with the highest prim count.  This handles both:
+    - FX caches: early frames are empty; later frames have geometry.
+    - Props: early frames may only have partial geometry (one layer); the
+      frame with the most prims (inside + outside + cork + pipe, etc.) wins.
+    """
+    if not seq_candidates:
+        return None, None, None
+
+    total = len(seq_candidates)
+    if total <= TOPO_SAMPLE_COUNT:
+        sample = seq_candidates
+    else:
+        indices = set()
+        indices.add(0)
+        indices.add(total - 1)
+        for k in range(1, TOPO_SAMPLE_COUNT - 1):
+            idx = int(round(k * (total - 1) / (TOPO_SAMPLE_COUNT - 1)))
+            indices.add(idx)
+        sample = [seq_candidates[i] for i in sorted(indices)]
+
+    best = None      # (prim_count, frame_num, clip_name, root_path, root_type)
+    fallback = None  # first readable frame regardless of prim count
+
+    for item in sample:
+        _, frame_num, frame_str, clip_base, clip_ext, clip_name = item
+        clip_path = os.path.join(VER_DIR, clip_name).replace("\\\\", "/")
+
+        stage = Usd.Stage.Open(clip_path)
+        if not stage:
+            continue
+
+        default_prim = stage.GetDefaultPrim()
+        if default_prim and default_prim.IsValid():
+            root_path = default_prim.GetPath().pathString
+            root_type = default_prim.GetTypeName() or "Xform"
+        else:
+            roots = stage.GetPseudoRoot().GetChildren()
+            if not roots:
+                del stage
+                continue
+            root_path = roots[0].GetPath().pathString
+            root_type = roots[0].GetTypeName() or "Xform"
+
+        if fallback is None:
+            fallback = (clip_name, root_path, root_type)
+
+        prim_count = _count_prims_under(stage, root_path)
+        del stage
+
+        if best is None or prim_count > best[0]:
+            best = (prim_count, frame_num, clip_name, root_path, root_type)
+
+    if best and best[0] > 0:
+        prim_count, frame_num, clip_name, root_path, root_type = best
+        _log("Topology frame: " + clip_name + " (frame " + str(frame_num) + ") — " + str(prim_count) + " prims (most complete in sample).")
+        return clip_name, root_path, root_type
+
+    if fallback:
+        _log("WARNING: no frame with geometry prims found; using first readable frame as topology source.")
+        return fallback
+
+    return None, None, None
+
+
+def _clip_root_single(clip_name):
+    clip_path = os.path.join(VER_DIR, clip_name).replace("\\\\", "/")
+    clip_stage = Usd.Stage.Open(clip_path)
     if not clip_stage:
-        raise RuntimeError("Could not open first clip file: " + first_clip_path)
+        raise RuntimeError("Could not open clip file: " + clip_path)
 
     default_prim = clip_stage.GetDefaultPrim()
     if default_prim and default_prim.IsValid():
-        return (
-            default_prim.GetPath().pathString,
-            default_prim.GetTypeName() or "Xform",
-        )
+        return default_prim.GetPath().pathString, default_prim.GetTypeName() or "Xform"
 
     roots = clip_stage.GetPseudoRoot().GetChildren()
     if not roots:
-        raise RuntimeError("No root prim found in clip: " + first_clip_path)
+        raise RuntimeError("No root prim found in clip: " + clip_path)
 
     return roots[0].GetPath().pathString, roots[0].GetTypeName() or "Xform"
+
+
+def _should_preserve_shallow_root_path(root_path, stage=None):
+    parts = [part for part in root_path.strip("/").split("/") if part]
+    if len(parts) != 1:
+        return False
+
+    root_name = parts[0]
+    if root_name.lower() in ("geometry", "geo"):
+        return False
+
+    if stage is not None:
+        prim = stage.GetPrimAtPath(root_path)
+        if prim and prim.IsValid():
+            if prim.GetChildren():
+                return True
+            if prim.GetAuthoredAttributes():
+                return True
+
+    return True
 
 
 def main():
     if not os.path.isdir(VER_DIR):
         raise RuntimeError("Version directory does not exist: " + VER_DIR)
 
+    # Sanitize node name — used as fallback prim name for generic/shallow paths.
+    node_name_safe = re.sub(r"[^A-Za-z0-9_]", "_", NODE_NAME)
+    if node_name_safe and node_name_safe[0].isdigit():
+        node_name_safe = "_" + node_name_safe
+    node_name_safe = node_name_safe or "fx_cache"
+
     is_sequence, clip_data = _pick_clip_files()
     if is_sequence:
-        _, first_frame, first_frame_str, clip_base, clip_ext, first_clip_name = clip_data
+        _, first_frame, first_frame_str, clip_base, clip_ext, _ = clip_data
         pad = len(first_frame_str)
+
+        # Rebuild full sorted seq_candidates list to scan for first non-empty frame.
+        seq_rx = re.compile(r"^(sequence|main)\\.(\\d+)\\.(usd|usdc|usda)$")
+        all_seq = []
+        for name in os.listdir(VER_DIR):
+            m = seq_rx.match(name)
+            if m:
+                base, fstr, ext = m.groups()
+                pref = 0 if base == "sequence" else 1
+                all_seq.append((pref, int(fstr), fstr, base, ext, name))
+        all_seq.sort(key=lambda x: (x[0], x[1]))
+
+        topo_clip_name, clip_root_path, clip_root_type = _find_topology_frame(all_seq)
+        if topo_clip_name is None:
+            raise RuntimeError("No readable clip files found in " + VER_DIR)
     else:
-        _, clip_base, clip_ext, first_clip_name = clip_data
+        _, clip_base, clip_ext, topo_clip_name = clip_data
         first_frame = F1
         pad = 1
+        clip_root_path, clip_root_type = _clip_root_single(topo_clip_name)
 
-    root_path, root_type = _clip_root(first_clip_name)
+    # ------------------------------------------------------------------
+    # Resolve wrapper prim path (mirrors local _resolve_wrapper_prim_path).
+    # Returns: wrapper_prim_path, default_prim_name, clip_ref_path, clip_anim_path
+    # ------------------------------------------------------------------
+    parts = [p for p in clip_root_path.strip("/").split("/") if p]
+    clip_ref_path = clip_root_path    # default: reference the clip root
+    clip_anim_path = clip_root_path   # default: animate from clip root
+    effective_type = clip_root_type
+
+    if len(parts) > 1:
+        # Deep path — already unique; preserve it.
+        wrapper_prim_path = clip_root_path
+        default_prim_name = parts[0]
+    else:
+        # Shallow path — try to unwrap single-child Xform container first.
+        topo_abs = os.path.join(VER_DIR, topo_clip_name).replace("\\\\", "/")
+        _peek_stage = Usd.Stage.Open(topo_abs)
+        inner_abs = clip_root_path
+        inner_type = clip_root_type
+        if _peek_stage and clip_root_path in ("/Geometry", "/ROOT", "/Root"):
+            _root = _peek_stage.GetPrimAtPath(clip_root_path)
+            if _root and _root.IsValid() and _root.GetTypeName() in ("", "Xform", "Scope"):
+                if not _root.GetAuthoredAttributes():
+                    _children = _root.GetChildren()
+                    if len(_children) == 1:
+                        _child = _children[0]
+                        inner_abs = _child.GetPath().pathString
+                        inner_type = _child.GetTypeName() or "Xform"
+                        _log("Unwrapped container " + clip_root_path + " to " + inner_abs)
+
+        if inner_abs != clip_root_path:
+            # Strip the container prefix to get the scene-correct wrapper path.
+            # e.g. inner_abs="/Geometry/World" clip_root_path="/Geometry"
+            #      wrapper = "/World"
+            wrapper_path = inner_abs[len(clip_root_path):]
+            w_parts = [p for p in wrapper_path.strip("/").split("/") if p]
+            if w_parts:
+                wrapper_prim_path = wrapper_path
+                default_prim_name = w_parts[0]
+                clip_ref_path = inner_abs      # reference the INNER prim in clip
+                clip_anim_path = inner_abs     # animate from the INNER prim path
+                effective_type = inner_type
+                _log("wrapper=" + wrapper_prim_path + "  ref/anim=" + clip_ref_path)
+            else:
+                wrapper_prim_path = "/" + node_name_safe
+                default_prim_name = node_name_safe
+        else:
+            if _should_preserve_shallow_root_path(clip_root_path, stage=_peek_stage):
+                wrapper_prim_path = clip_root_path
+                default_prim_name = parts[0]
+            else:
+                # Pure FX geometry prim — rename to /{node_name} to avoid collision.
+                wrapper_prim_path = "/" + node_name_safe
+                default_prim_name = node_name_safe
+        del _peek_stage
+
+    _log("clip_root=" + clip_root_path + "  wrapper=" + wrapper_prim_path + "  ref=" + clip_ref_path + "  anim=" + clip_anim_path)
 
     if os.path.exists(MAIN_PATH):
         os.remove(MAIN_PATH)
 
     stage = Usd.Stage.CreateNew(MAIN_PATH)
-    root_prim = stage.DefinePrim(root_path, root_type)
-    stage.SetDefaultPrim(root_prim)
     stage.SetStartTimeCode(F1)
     stage.SetEndTimeCode(F2)
+
+    root_prim = stage.DefinePrim(wrapper_prim_path, effective_type)
+
+    # defaultPrim must be a root-level prim.
+    default_prim = stage.GetPrimAtPath("/" + default_prim_name)
+    if default_prim and default_prim.IsValid():
+        stage.SetDefaultPrim(default_prim)
+
+    # Reference clip_ref_path (the INNER prim for unwrapped cases) so children
+    # appear directly under wrapper_prim_path without double-nesting.
+    root_prim.GetReferences().AddReference("./{{}}".format(topo_clip_name), clip_ref_path)
 
     if is_sequence:
         clips = Usd.ClipsAPI(root_prim)
@@ -894,24 +1476,15 @@ def main():
         clips.SetClipTemplateStartTime(F1)
         clips.SetClipTemplateEndTime(F2)
         clips.SetClipTemplateStride(1.0)
-        clips.SetClipActive([(F1, 0)])
-        clips.SetClipTimes([(F1, F1), (F2, F2)])
-        clips.SetClipPrimPath(root_path)
-        root_prim.GetReferences().AddReference(
-            "./{{}}.{{}}.{{}}".format(clip_base, str(first_frame).zfill(pad), clip_ext),
-            root_path,
-        )
-    else:
-        root_prim.GetReferences().AddReference(
-            "./{{}}.{{}}".format(clip_base, clip_ext),
-            root_path,
-        )
+        # clip_anim_path = inner absolute path in each frame file for time samples.
+        clips.SetClipPrimPath(clip_anim_path)
 
     stage.GetRootLayer().Save()
+
     if not os.path.exists(MAIN_PATH):
         raise RuntimeError("Save completed but master.usdc was not found: " + MAIN_PATH)
 
-    _log("Created " + MAIN_PATH + " | ClipPrim: " + root_path)
+    _log("Created " + MAIN_PATH + " | wrapperPrim: " + wrapper_prim_path + " | clipPrimPath: " + clip_anim_path + " | topo: " + topo_clip_name)
 
 
 if __name__ == "__main__":
@@ -925,9 +1498,10 @@ if __name__ == "__main__":
 
 def _write_master_wrapper_job_script(node, version, f1, f2):
     ver_dir = version_dir(node, version, create=True)
+    node_name = _sanitize_usd_prim_name(node.name())
     script_path = os.path.join(ver_dir, ".create_master_wrapper.py")
     with open(script_path, "w") as stream:
-        stream.write(_master_wrapper_job_script_source(ver_dir, f1, f2))
+        stream.write(_master_wrapper_job_script_source(ver_dir, f1, f2, node_name))
     return script_path
 
 
