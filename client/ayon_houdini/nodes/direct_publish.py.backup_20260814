@@ -393,39 +393,6 @@ def _detect_numbered_sequence(filepaths):
     }
 
 
-def _representation_path_metadata(
-    filepaths,
-    project_name,
-    representation_name,
-    extension,
-):
-    """Build path metadata expected by AYON representation loaders."""
-    published_path = _rootless_path(
-        _normalize_path(filepaths[0]),
-        project_name,
-    )
-    template = published_path
-    context = {
-        "representation": representation_name,
-        "ext": extension,
-    }
-
-    sequence_info = _detect_numbered_sequence(filepaths)
-    if sequence_info:
-        template = _normalize_path(os.path.join(
-            os.path.dirname(published_path),
-            "{}{{frame}}{}".format(
-                sequence_info["prefix"],
-                sequence_info["suffix"],
-            ),
-        ))
-        context["frame"] = str(sequence_info["start_frame"]).zfill(
-            sequence_info["padding"]
-        )
-
-    return published_path, template, context
-
-
 def _get_review_fps(default=24.0):
     try:
         import hou
@@ -1449,21 +1416,13 @@ def publish_files(
                         )
                     )
 
-    final_version_attrib = dict(version_attrib or {})
-    if frame_start is not None:
-        final_version_attrib.setdefault("frameStart", int(frame_start))
-    if frame_end is not None:
-        final_version_attrib.setdefault("frameEnd", int(frame_end))
-    if frame_start is not None or frame_end is not None:
-        final_version_attrib.setdefault("fps", _get_review_fps(default=24.0))
-
     version_id = create_version(
         project_name=project_name,
         product_id=product_id,
         version=version_number,
         task_id=task_id,
         author=author,
-        attrib=final_version_attrib,
+        attrib=version_attrib,
         data=version_data,
         tags=version_tags,
         status=version_status,
@@ -1492,25 +1451,13 @@ def publish_files(
             product_type, extension
         )
 
-    published_path, path_template, representation_context = (
-        _representation_path_metadata(
-            filepaths=filepaths,
-            project_name=project_name,
-            representation_name=representation_name,
-            extension=extension,
-        )
-    )
     final_representation_attrib = {
-        "path": published_path,
-        "template": path_template,
+        "path": _rootless_path(_normalize_path(filepaths[0]), project_name)
     }
     if representation_attrib:
         final_representation_attrib.update(representation_attrib)
 
     final_representation_data = dict(representation_data or {})
-    supplied_context = final_representation_data.get("context") or {}
-    representation_context.update(supplied_context)
-    final_representation_data["context"] = representation_context
     if frame_start is not None:
         final_representation_data.setdefault("frameStart", int(frame_start))
     if frame_end is not None:

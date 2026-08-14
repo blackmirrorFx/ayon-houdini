@@ -9,6 +9,7 @@ import tempfile
 from datetime import datetime
 
 import hou
+from ayon_core.lib import get_ffmpeg_tool_args
 from qtpy import QtCore, QtGui, QtWidgets
 
 log = logging.getLogger("ayon.flipbook")
@@ -941,8 +942,13 @@ class FlipbookShelfTool(QtWidgets.QDialog):
             )
 
         profile = self.output_profile_combo.currentData()
-        if profile != "sequence_only" and not shutil.which("ffmpeg"):
-            raise RuntimeError("ffmpeg was not found in PATH.")
+        if profile != "sequence_only":
+            try:
+                get_ffmpeg_tool_args("ffmpeg")
+            except Exception as exc:
+                raise RuntimeError(
+                    "FFmpeg could not be resolved through AYON."
+                ) from exc
         if for_deadline and not shutil.which("deadlinecommand"):
             raise RuntimeError("deadlinecommand was not found in PATH.")
 

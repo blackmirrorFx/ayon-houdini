@@ -1,0 +1,91 @@
+# Dialog script for bmfx_render_dispatcher::1.0 automatically generated
+
+{
+    name	bmfx_render_dispatcher::1.0
+    script	bmfx_render_dispatcher::1.0
+    label	"BMFX Render Dispatcher"
+
+    help {
+	"Preflight RenderVars and RenderPasses, then dispatch filtered jobs to Deadline."
+    }
+
+    inputlabel	1	"Input Stage"
+
+    parm {
+        name    "preflight"
+        label   "Preflight Check"
+        type    button
+        default { "0" }
+        help    "Inspect AOVs, passes and output paths before dispatching to the farm."
+        parmtag { "script_callback" "import importlib; from ayon_houdini.nodes.lops import render_dispatcher; importlib.reload(render_dispatcher); render_dispatcher.preflight(kwargs)" }
+        parmtag { "script_callback_language" "python" }
+    }
+    parm {
+        name    "dispatcher_filter_active"
+        label   "Dispatcher Filter Active"
+        type    toggle
+        invisible
+        default { "0" }
+    }
+    parm {
+        name    "dispatcher_selected_aovs"
+        label   "Selected AOV Paths"
+        type    string
+        invisible
+        default { "[]" }
+    }
+    parm {
+        name    "dispatcher_selected_passes"
+        label   "Selected Render Pass Paths"
+        type    string
+        invisible
+        default { "[]" }
+    }
+    parm {
+        name    "range"
+        label   "Start / End / Inc"
+        type    intvector
+        size    3
+        default { "$FSTART" "$FEND" "1" }
+        range   { -1 1 }
+        parmtag { "script_callback_language" "python" }
+    }
+    parm {
+        name    "prio"
+        label   "Priority"
+        type    integer
+        default { "50" }
+        range   { 0 10 }
+        parmtag { "script_callback_language" "python" }
+    }
+    parm {
+        name    "chunks"
+        label   "Chunks"
+        type    integer
+        default { "1" }
+        range   { 0 10 }
+        parmtag { "script_callback_language" "python" }
+    }
+    parm {
+        name    "dodenoise"
+        label   "Post Denoise AOVs"
+        type    toggle
+        default { "1" }
+        parmtag { "script_callback_language" "python" }
+    }
+    parm {
+        name    "denoisechunks"
+        label   "Denoise Chunks"
+        type    integer
+        default { "10" }
+        range   { 0 10 }
+        parmtag { "script_callback_language" "python" }
+    }
+    parm {
+        name    "pubayon"
+        label   "Publish on Ayon"
+        type    toggle
+        default { "1" }
+        parmtag { "script_callback_language" "python" }
+    }
+}

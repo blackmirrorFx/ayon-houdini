@@ -127,19 +127,6 @@ def _emit_deadline_progress(percent):
     _flush_stdio()
 
 
-def _enable_deadline_usdrender_progress():
-    """Select Deadline's legacy RenderMan progress parser for USD Render.
-
-    Deadline 10 detects the Houdini node as ``usdrender`` but its Houdini
-    plugin does not update progress for that ROP type.  The same plugin does
-    understand RenderMan's ``RMAN_PROGRESS`` and our ``ALF_PROGRESS`` lines
-    when its internal type is ``ris::22``.  This stdout marker only changes
-    Deadline's parser state; it does not alter Houdini's renderer or ROP.
-    """
-    print("ROP type: ris::22", flush=True)
-    _flush_stdio()
-
-
 # --------------------------------------------------
 # CALLBACKS
 # --------------------------------------------------
@@ -155,12 +142,6 @@ def on_prerender():
     _LOGGER.info("Node : %s", render_node.path() if render_node else "<unknown>")
     _LOGGER.info("=" * 50)
     _emit_deadline_progress(0)
-
-
-def on_dispatch_prerender():
-    """Pre-render callback for dispatcher-created USD Render ROPs."""
-    _enable_deadline_usdrender_progress()
-    on_prerender()
 
 
 def on_preframe():
@@ -196,11 +177,6 @@ def on_postframe():
         int(round(percent))
     )
     _flush_stdio()
-
-
-def on_dispatch_postframe():
-    """Report per-frame progress for a dispatcher render task."""
-    on_postframe()
 
 
 def on_postrender():

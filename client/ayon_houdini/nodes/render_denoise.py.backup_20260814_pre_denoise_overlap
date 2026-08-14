@@ -1,0 +1,153 @@
+"""Farm-safe wrapper around RenderMan's offline ``denoise_batch`` tool."""
+
+from __future__ import annotations
+
+import argparse
+import os
+import re
+import shutil
+import subprocess
+import sys
+
+
+def _frame_path(template, frame, padding):
+    token = "#" * int(padding)
+    return template.replace(token, str(int(frame)).zfill(int(padding)))
+
+
+def _emit_progress(percent):
+    percent = max(0, min(100, int(float(percent))))
+    print("Progress: {}%".format(percent), flush=True)
+
+
+def _validate_inputs(template, start, end, padding):
+    missing = [
+        _frame_path(template, frame, padding)
+        for frame in range(int(start), int(end) + 1)
+        if not os.path.isfile(_frame_path(template, frame, padding))
+    ]
+    if missing:
+        preview = "\n".join(missing[:10])
+        remainder = len(missing) - min(10, len(missing))
+        if remainder:
+            preview += "\n... and {} more".format(remainder)
+        raise RuntimeError(
+            "Denoise input sequence is incomplete ({} missing):\n{}".format(
+                len(missing), preview
+            )
+        )
+
+
+def _replace_originals(input_template, output_dir, start, end, padding):
+    """Atomically replace only the source frames handled by this task."""
+    for frame in range(int(start), int(end) + 1):
+        original = _frame_path(input_template, frame, padding)
+        basename = os.path.basename(original)
+        candidate = os.path.join(output_dir, basename)
+        if not os.path.isfile(candidate):
+            matches = []
+            for root, _dirs, files in os.walk(output_dir):
+                if basename in files:
+                    matches.append(os.path.join(root, basename))
+            if len(matches) != 1:
+                raise RuntimeError(
+                    "Expected one denoised result for {}, found {}.".format(
+                        original, len(matches)
+                    )
+                )
+            candidate = matches[0]
+        if os.path.getsize(candidate) <= 0:
+            raise RuntimeError("Denoised output is empty: {}".format(candidate))
+        os.replace(candidate, original)
+        print("Replaced source render: {}".format(original), flush=True)
+
+
+def run_denoise(
+    executable,
+    input_template,
+    output_dir,
+    start,
+    end,
+    padding=4,
+    replace_original=False,
+):
+    """Run RenderMan denoise_batch and normalize progress for Deadline."""
+    if not os.path.isfile(executable):
+        raise RuntimeError("RenderMan denoise_batch was not found: {}".format(executable))
+    _validate_inputs(input_template, start, end, padding)
+    os.makedirs(output_dir, exist_ok=True)
+
+    command = [executable]
+    if int(end) > int(start):
+        command.extend(("--crossframe", "--flow"))
+    command.extend((
+        "--progress",
+        "--output", output_dir,
+        input_template,
+        "{}-{}".format(int(start), int(end)),
+    ))
+    print("RenderMan denoise command: {}".format(" ".join(command)), flush=True)
+    _emit_progress(0)
+    process = subprocess.Popen(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+    )
+    last_progress = -1
+    assert process.stdout is not None
+    for line in process.stdout:
+        line = line.rstrip()
+        print(line, flush=True)
+        match = re.search(
+            r"(?:ALF_PROGRESS|Progress:?)[^0-9]*([0-9]+(?:\.[0-9]+)?)%?",
+            line,
+            re.IGNORECASE,
+        )
+        if match:
+            progress = int(float(match.group(1)))
+            if progress != last_progress:
+                _emit_progress(progress)
+                last_progress = progress
+    return_code = process.wait()
+    if return_code:
+        raise RuntimeError(
+            "RenderMan denoise_batch failed with exit code {}".format(return_code)
+        )
+    if replace_original:
+        _replace_originals(input_template, output_dir, start, end, padding)
+        # This directory is unique to a Deadline task and now contains no
+        # deliverables. Remove it without touching the version directory.
+        shutil.rmtree(output_dir, ignore_errors=True)
+    _emit_progress(100)
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--executable", required=True)
+    parser.add_argument("--input", required=True, dest="input_template")
+    parser.add_argument("--output", required=True, dest="output_dir")
+    parser.add_argument("--start", required=True, type=int)
+    parser.add_argument("--end", required=True, type=int)
+    parser.add_argument("--padding", type=int, default=4)
+    parser.add_argument("--replace-original", action="store_true")
+    args = parser.parse_args(argv)
+    run_denoise(
+        args.executable,
+        args.input_template,
+        args.output_dir,
+        args.start,
+        args.end,
+        padding=args.padding,
+        replace_original=args.replace_original,
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except Exception as exc:
+        print("DENOISE ERROR: {}".format(exc), file=sys.stderr, flush=True)
+        raise

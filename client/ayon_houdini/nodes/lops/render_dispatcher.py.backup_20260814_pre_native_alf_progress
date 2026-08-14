@@ -1,8 +1,8 @@
 """Preflight and farm dispatch for the BMFX Render Dispatcher LOP.
 
-The HDA is deliberately small: it is a pass-through Python LOP whose farm
-parameters and *Preflight Check* button drive :class:`RenderDispatcherDialog`.
-The dialog reads RenderVars, RenderPasses, RenderSettings and RenderProducts from the
+The HDA is deliberately small: it is a pass-through Python LOP with a single
+visible *Preflight Check* button.  The button opens :class:`RenderDispatcherDialog`,
+which reads RenderVars, RenderPasses, RenderSettings and RenderProducts from the
 incoming USD stage.  A dispatch stores the chosen paths in hidden HDA parameters,
 saves one filtered HIP snapshot per pass and submits those snapshots to Deadline.
 
@@ -182,18 +182,6 @@ class PreflightData:
     warnings: list[str] = field(default_factory=list)
 
 
-@dataclass(frozen=True)
-class DispatchSettings:
-    frame_start: int
-    frame_end: int
-    frame_step: int = 1
-    priority: int = 50
-    chunk_size: int = 1
-    enable_denoise: bool = True
-    denoise_chunk_size: int = 10
-    publish_on_ayon: bool = True
-
-
 def _require_houdini():
     if hou is None:
         raise RuntimeError("This operation must run inside Houdini.")
@@ -211,61 +199,6 @@ def _resolve_node(node_or_kwargs=None):
     if isinstance(node_or_kwargs, str):
         return hou.node(node_or_kwargs)
     return None
-
-
-def _eval_node_parm(node, name, default):
-    parm = node.parm(name) if node is not None else None
-    if parm is None:
-        return default
-    try:
-        return parm.eval()
-    except Exception:
-        return default
-
-
-def _dispatch_settings_from_node(node):
-    """Read farm settings authored on the Render Dispatcher HDA."""
-    try:
-        default_start, default_end = hou.playbar.frameRange()
-    except Exception:
-        default_start, default_end = (1, 1)
-
-    range_values = None
-    range_tuple = node.parmTuple("range") if node is not None else None
-    if range_tuple is not None:
-        try:
-            range_values = range_tuple.eval()
-        except Exception:
-            range_values = None
-    if not range_values or len(range_values) < 3:
-        range_values = (
-            _eval_node_parm(node, "range1", default_start),
-            _eval_node_parm(node, "range2", default_end),
-            _eval_node_parm(node, "range3", 1),
-        )
-
-    frame_step = int(range_values[2])
-    if frame_step <= 0:
-        frame_step = 1
-        increment_parm = node.parm("range3") if node is not None else None
-        if increment_parm is not None:
-            try:
-                increment_parm.set(1)
-            except Exception:
-                pass
-
-    return DispatchSettings(
-        frame_start=int(range_values[0]),
-        frame_end=int(range_values[1]),
-        frame_step=frame_step,
-        priority=max(0, min(100, int(_eval_node_parm(node, "prio", 50)))),
-        chunk_size=max(1, int(_eval_node_parm(node, "chunks", 1))),
-        enable_denoise=bool(_eval_node_parm(node, "dodenoise", 1)),
-        denoise_chunk_size=max(
-            1, int(_eval_node_parm(node, "denoisechunks", 10))
-        ),
-        publish_on_ayon=bool(_eval_node_parm(node, "pubayon", 1)),
-    )
 
 
 def _resolve_stage(node):
@@ -993,8 +926,7 @@ def collect_preflight(node_or_kwargs=None) -> PreflightData:
 
 
 def validate_preflight(
-    node, data, frame_start=None, frame_end=None, frame_step=1,
-    enable_denoise=True
+    node, data, frame_start=None, frame_end=None, enable_denoise=True
 ):
     """Return ``(severity, message)`` records for user-facing preflight checks."""
     issues = []
@@ -1028,20 +960,6 @@ def validate_preflight(
     if frame_start is not None and frame_end is not None:
         if int(frame_end) < int(frame_start):
             issues.append(("error", "Frame end is before frame start."))
-        if int(frame_step) < 1:
-            issues.append(("error", "Frame increment must be at least 1."))
-        if int(frame_step) != 1 and any(
-            _normalized_pass_preset(
-                entry.preset,
-                pass_name=entry.name,
-                department=entry.department,
-            ) == "Beauty"
-            for entry in data.passes
-        ):
-            issues.append((
-                "error",
-                "Beauty renders require an increment of 1 for denoise and review media.",
-            ))
 
     safe_names = {}
     output_paths = {}
@@ -1297,7 +1215,6 @@ def _create_usd_render_rop(
     pass_entry,
     frame_start,
     frame_end,
-    frame_step=1,
     output_path="",
 ):
     out = hou.node("/out")
@@ -1354,11 +1271,10 @@ def _create_usd_render_rop(
         _set_first_parm(rop, ("allframesatonce",), 0)
         _set_first_parm(rop, ("trange",), 1)
         if rop.parmTuple("f"):
-            rop.parmTuple("f").set((frame_start, frame_end, frame_step))
+            rop.parmTuple("f").set((frame_start, frame_end, 1))
         else:
             _set_first_parm(rop, ("f1", "startframe"), frame_start)
             _set_first_parm(rop, ("f2", "endframe"), frame_end)
-            _set_first_parm(rop, ("f3", "frameinc", "increment"), frame_step)
         return rop
     except Exception:
         rop.destroy()
@@ -1699,7 +1615,6 @@ def _submit_denoise_job(
     pool,
     group,
     priority,
-    chunk_size=10,
 ):
     """Submit one sequence-aware RenderMan denoise job after a render job."""
     denoise_executable = _renderman_denoise_executable()
@@ -1738,7 +1653,7 @@ def _submit_denoise_job(
         "Plugin": "CommandLine",
         "Name": "{}-Denoise".format(render_job_name),
         "Frames": "{}-{}".format(int(frame_start), int(frame_end)),
-        "ChunkSize": max(1, int(chunk_size)),
+        "ChunkSize": 10,
         "Pool": pool.strip(),
         "Group": group.strip(),
         "Priority": priority,
@@ -1819,12 +1734,9 @@ def _submit_denoise_job(
         "input_template": input_template,
         "staging_directory": staging_root,
         "chunk_output_pattern": output_dir,
-        "chunk_size": max(1, int(chunk_size)),
+        "chunk_size": 10,
         "task_count": (
-            (
-                int(frame_end) - int(frame_start) + 1
-                + max(1, int(chunk_size)) - 1
-            ) // max(1, int(chunk_size))
+            (int(frame_end) - int(frame_start) + 1 + 9) // 10
         ),
         "frame_range": [int(frame_start), int(frame_end), 1],
         "replacement": "dependent_finalize_job",
@@ -1947,7 +1859,7 @@ def _submit_review_media_job(
     }
 
 
-def _render_sequence_filenames(output_path, frame_start, frame_end, frame_step=1):
+def _render_sequence_filenames(output_path, frame_start, frame_end):
     """Return the exact sequence filenames expected from a Houdini path."""
     basename = os.path.basename(str(output_path))
     token_match = re.search(r"\$F(\d*)\b", basename)
@@ -1957,9 +1869,7 @@ def _render_sequence_filenames(output_path, frame_start, frame_end, frame_step=1
     token = token_match.group(0)
     filenames = [
         basename.replace(token, str(frame).zfill(padding))
-        for frame in range(
-            int(frame_start), int(frame_end) + 1, max(1, int(frame_step))
-        )
+        for frame in range(int(frame_start), int(frame_end) + 1)
     ]
     # AYON expects a single-frame representation to use a string; a one-item
     # list is interpreted as a malformed image sequence by its integrator.
@@ -2004,7 +1914,6 @@ def _write_ayon_publish_metadata(
     output_path,
     frame_start,
     frame_end,
-    frame_step,
     review_media,
     pass_name,
     preset,
@@ -2029,14 +1938,13 @@ def _write_ayon_publish_metadata(
 
     frame_start = int(frame_start)
     frame_end = int(frame_end)
-    frame_step = max(1, int(frame_step))
     fps = float(hou.fps())
     output_directory = os.path.dirname(output_path)
     representations = [{
         "name": "exr",
         "ext": "exr",
         "files": _render_sequence_filenames(
-            output_path, frame_start, frame_end, frame_step
+            output_path, frame_start, frame_end
         ),
         "stagingDir": output_directory,
         "stagingDir_persistent": True,
@@ -2081,7 +1989,7 @@ def _write_ayon_publish_metadata(
         "frameEndHandle": frame_end,
         "handleStart": 0,
         "handleEnd": 0,
-        "byFrameStep": frame_step,
+        "byFrameStep": 1,
         "fps": fps,
         "stagingDir": output_directory,
         "stagingDir_persistent": True,
@@ -2124,7 +2032,6 @@ def _submit_ayon_publish_job(
     output_path,
     frame_start,
     frame_end,
-    frame_step,
     review_media,
     pass_name,
     preset,
@@ -2143,7 +2050,6 @@ def _submit_ayon_publish_job(
         output_path=output_path,
         frame_start=frame_start,
         frame_end=frame_end,
-        frame_step=frame_step,
         review_media=review_media,
         pass_name=pass_name,
         preset=preset,
@@ -2162,13 +2068,6 @@ def _submit_ayon_publish_job(
     }
     environment = _farm_environment()
     environment.update(metadata["session"])
-    # The Deadline Ayon plugin prefers a job-level API key over its repository
-    # configuration. Our farm currently has a stale configured key, while the
-    # AYON-launched Houdini session has the valid credential. Keep the secret
-    # out of the persistent publish metadata and add it only to the farm job.
-    ayon_api_key = os.getenv("AYON_API_KEY")
-    if ayon_api_key:
-        environment["AYON_API_KEY"] = ayon_api_key
     for index, (key, value) in enumerate(sorted(environment.items())):
         if value and "\n" not in str(value):
             job_info["EnvironmentKeyValue{}".format(index)] = "{}={}".format(
@@ -2240,7 +2139,6 @@ def dispatch_to_deadline(
     selected_passes,
     frame_start,
     frame_end,
-    frame_step=1,
     pool="",
     group="",
     priority=50,
@@ -2250,8 +2148,6 @@ def dispatch_to_deadline(
     progress_callback=None,
     aovs_by_pass=None,
     enable_denoise=True,
-    denoise_chunk_size=10,
-    publish_on_ayon=True,
 ):
     """Submit one filtered HIP snapshot per selected pass to Deadline."""
     node = _resolve_node(node_or_kwargs)
@@ -2276,33 +2172,12 @@ def dispatch_to_deadline(
 
     frame_start = int(frame_start)
     frame_end = int(frame_end)
-    frame_step = max(1, int(frame_step))
     if frame_end < frame_start:
         raise ValueError("Frame end must be greater than or equal to frame start.")
     priority = max(0, min(100, int(priority)))
-    chunk_size = max(1, int(chunk_size))
-    denoise_chunk_size = max(1, int(denoise_chunk_size))
+    # Render Dispatcher jobs always use one frame per Deadline task.
+    chunk_size = 1
     machine_limit = max(0, int(machine_limit))
-    render_frame_count = ((frame_end - frame_start) // frame_step) + 1
-    render_task_count = (
-        render_frame_count + chunk_size - 1
-    ) // chunk_size
-
-    has_beauty_pass = any(
-        _normalized_pass_preset(
-            entry.preset,
-            pass_name=entry.name,
-            department=entry.department,
-        ) == "Beauty"
-        for entry in selected_pass_entries
-    )
-    if has_beauty_pass and frame_step != 1:
-        raise ValueError(
-            "Beauty renders require a frame increment of 1 for denoise and review media."
-        )
-    deadline_frames = "{}-{}".format(frame_start, frame_end)
-    if frame_step != 1:
-        deadline_frames += "x{}".format(frame_step)
 
     hidden_parms = {
         name: node.parm(name).eval()
@@ -2369,7 +2244,6 @@ def dispatch_to_deadline(
                 pass_entry,
                 frame_start,
                 frame_end,
-                frame_step=frame_step,
                 output_path=pass_output_path,
             )
             rops.append(rop)
@@ -2384,29 +2258,10 @@ def dispatch_to_deadline(
             _save_snapshot(hip_path)
 
             display_name = "{}-v{:03d}".format(pass_entry.name, version)
-            render_wrapper = os.path.join(
-                os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                "render_farm.py",
-            )
-            render_python = shutil.which("python3")
-            hython_executable = os.path.join(
-                hou.expandString("$HFS"), "bin", "hython"
-            )
-            missing_launcher = [
-                path
-                for path in (render_wrapper, render_python, hython_executable)
-                if not path or not os.path.isfile(path)
-            ]
-            if missing_launcher:
-                raise RuntimeError(
-                    "Farm render launcher is incomplete: {}".format(
-                        ", ".join(str(path) for path in missing_launcher)
-                    )
-                )
             job_info = {
-                "Plugin": "CommandLine",
+                "Plugin": "Houdini",
                 "Name": display_name,
-                "Frames": deadline_frames,
+                "Frames": "{}-{}".format(frame_start, frame_end),
                 "ChunkSize": chunk_size,
                 "Pool": pool.strip(),
                 "Group": group.strip(),
@@ -2417,22 +2272,17 @@ def dispatch_to_deadline(
                 "OutputFilename0": pass_output_path or None,
             }
             _add_pipeline_environment(job_info, start_index=2)
-            render_arguments = " ".join((
-                _quoted_argument(render_wrapper),
-                "--hython", _quoted_argument(hython_executable),
-                "--scene", _quoted_argument(hip_path),
-                "--rop", _quoted_argument(rop.path()),
-                "--context", _quoted_argument(context_path),
-                "--start", "<STARTFRAME>",
-                "--end", "<ENDFRAME>",
-                "--step", str(frame_step),
-            ))
+            application_version = hou.applicationVersion()
             plugin_info = {
-                "Executable": render_python,
-                "Arguments": render_arguments,
-                "StartupDirectory": version_root,
-                "ShellExecute": False,
-                "SingleFramesOnly": False,
+                "SceneFile": hip_path,
+                "OutputDriver": rop.path(),
+                "Version": "{}.{}".format(
+                    application_version[0], application_version[1]
+                ),
+                "Build": "64bit",
+                "IgnoreSceneFileFrameRange": True,
+                "StartFrame": frame_start,
+                "EndFrame": frame_end,
             }
             job_path = _write_info_file(
                 version_root, "deadline_job.info", job_info
@@ -2481,7 +2331,6 @@ def dispatch_to_deadline(
                     pool=pool,
                     group=group,
                     priority=priority,
-                    chunk_size=denoise_chunk_size,
                 )
             manifest_path = _write_submission_manifest(
                 version_root,
@@ -2514,13 +2363,12 @@ def dispatch_to_deadline(
                         "group": group.strip(),
                         "priority": priority,
                         "chunk_size": chunk_size,
-                        "frame_count": render_frame_count,
-                        "task_count": render_task_count,
+                        "task_count": frame_end - frame_start + 1,
                         "machine_limit": machine_limit,
                     },
                     "deadline_job_id": job_id,
                     "denoise": denoise_data,
-                    "frame_range": [frame_start, frame_end, frame_step],
+                    "frame_range": [frame_start, frame_end, 1],
                     "hip_file": hip_path,
                     "output_path": pass_output_path,
                     "pass_name": pass_entry.name,
@@ -2611,42 +2459,36 @@ def dispatch_to_deadline(
                 if review_media.get("enabled")
                 else record["terminal_job_id"]
             )
-            ayon_publish = {
-                "enabled": False,
-                "reason": "Disabled on Render Dispatcher HDA",
-            }
-            if publish_on_ayon:
-                _notify_dispatch_progress(
-                    progress_callback,
-                    pass_entry,
-                    record["pass_index"],
-                    total_passes,
-                    "Submitting AYON Publish",
-                    98,
-                    version=record["version"],
-                    job_id=record["render_job_id"],
-                )
-                ayon_publish = _submit_ayon_publish_job(
-                    deadline_command=deadline_command,
-                    version_root=record["version_root"],
-                    dependency_job_id=publish_dependency_id,
-                    render_job_id=record["render_job_id"],
-                    render_job_name=record["render_job_name"],
-                    product_name=record["product_name"],
-                    version=record["version"],
-                    source_hip=record["source_hip"],
-                    output_path=record["input_path"],
-                    frame_start=frame_start,
-                    frame_end=frame_end,
-                    frame_step=frame_step,
-                    review_media=review_media,
-                    pass_name=pass_entry.name,
-                    preset=record["preset"],
-                    department=record["department"],
-                    pool=pool,
-                    group=group,
-                    priority=priority,
-                )
+            _notify_dispatch_progress(
+                progress_callback,
+                pass_entry,
+                record["pass_index"],
+                total_passes,
+                "Submitting AYON Publish",
+                98,
+                version=record["version"],
+                job_id=record["render_job_id"],
+            )
+            ayon_publish = _submit_ayon_publish_job(
+                deadline_command=deadline_command,
+                version_root=record["version_root"],
+                dependency_job_id=publish_dependency_id,
+                render_job_id=record["render_job_id"],
+                render_job_name=record["render_job_name"],
+                product_name=record["product_name"],
+                version=record["version"],
+                source_hip=record["source_hip"],
+                output_path=record["input_path"],
+                frame_start=frame_start,
+                frame_end=frame_end,
+                review_media=review_media,
+                pass_name=pass_entry.name,
+                preset=record["preset"],
+                department=record["department"],
+                pool=pool,
+                group=group,
+                priority=priority,
+            )
             try:
                 with open(record["manifest_path"], "r") as stream:
                     manifest_payload = json.load(stream)
@@ -2660,8 +2502,14 @@ def dispatch_to_deadline(
                 pass_entry,
                 record["pass_index"],
                 total_passes,
-                "Farm chain submitted{}".format(
-                    " with AYON Publish" if publish_on_ayon else ""
+                (
+                    (
+                        "Render + Denoise + Media + AYON Publish Submitted"
+                        if record["denoise_enabled"]
+                        else "Render + Media + AYON Publish Submitted"
+                    )
+                    if review_media.get("enabled")
+                    else "Render + AYON Publish Submitted"
                 ),
                 100,
                 version=record["version"],
@@ -3034,6 +2882,37 @@ class RenderDispatcherDialog(QtWidgets.QDialog if QtWidgets is not None else obj
         output_group.setFixedHeight(215)
         layout.addWidget(output_group)
 
+        farm_group = QtWidgets.QGroupBox("FRAME / PRIORITY")
+        farm_layout = QtWidgets.QHBoxLayout(farm_group)
+        farm_layout.setContentsMargins(12, 14, 12, 8)
+        farm_layout.setSpacing(8)
+        self.frame_start = QtWidgets.QSpinBox()
+        self.frame_end = QtWidgets.QSpinBox()
+        for widget in (self.frame_start, self.frame_end):
+            widget.setRange(-1000000, 1000000)
+        self.frame_start.setValue(int(hou.playbar.frameRange()[0]))
+        self.frame_end.setValue(int(hou.playbar.frameRange()[1]))
+        self.priority = QtWidgets.QSpinBox()
+        self.priority.setRange(0, 100)
+        self.priority.setValue(50)
+        self.enable_denoise = QtWidgets.QCheckBox("Post Denoise Beauty")
+        self.enable_denoise.setChecked(True)
+        self.enable_denoise.setToolTip(
+            "Submit a dependent RenderMan denoise_batch job after each Beauty render."
+        )
+
+        farm_layout.addWidget(QtWidgets.QLabel("Frame Range"))
+        farm_layout.addWidget(self.frame_start, 1)
+        farm_layout.addWidget(QtWidgets.QLabel("to"))
+        farm_layout.addWidget(self.frame_end, 1)
+        farm_layout.addSpacing(16)
+        farm_layout.addWidget(QtWidgets.QLabel("Priority"))
+        farm_layout.addWidget(self.priority, 1)
+        farm_layout.addSpacing(16)
+        farm_layout.addWidget(self.enable_denoise)
+        farm_group.setFixedHeight(62)
+        layout.addWidget(farm_group)
+
         validation_group = QtWidgets.QGroupBox("PREFLIGHT VALIDATION")
         validation_layout = QtWidgets.QVBoxLayout(validation_group)
         self.validation_list = QtWidgets.QListWidget()
@@ -3063,6 +2942,9 @@ class RenderDispatcherDialog(QtWidgets.QDialog if QtWidgets is not None else obj
         self.pass_search.textChanged.connect(self._filter_passes)
         self.pass_list.currentItemChanged.connect(self._on_pass_current_changed)
         self.aov_list.itemChanged.connect(self._on_aov_item_changed)
+        self.frame_start.valueChanged.connect(self._update_validation)
+        self.frame_end.valueChanged.connect(self._update_validation)
+        self.enable_denoise.toggled.connect(self._update_validation)
 
     def _check_group(
         self, title, list_widget, search_widget=None, context_widget=None,
@@ -3254,14 +3136,12 @@ class RenderDispatcherDialog(QtWidgets.QDialog if QtWidgets is not None else obj
             item.setHidden(bool(query and query not in item.text().lower()))
 
     def _update_validation(self):
-        settings = _dispatch_settings_from_node(self.node)
         issues = validate_preflight(
             self.node,
             self.preflight,
-            settings.frame_start,
-            settings.frame_end,
-            frame_step=settings.frame_step,
-            enable_denoise=settings.enable_denoise,
+            self.frame_start.value(),
+            self.frame_end.value(),
+            enable_denoise=self.enable_denoise.isChecked(),
         )
         colors = {"ok": "#55c68c", "warning": "#e0b15b", "error": "#ef6b73"}
         symbols = {"ok": "OK", "warning": "WARNING", "error": "ERROR"}
@@ -3302,7 +3182,6 @@ class RenderDispatcherDialog(QtWidgets.QDialog if QtWidgets is not None else obj
         self._run_dispatch(selected_passes)
 
     def _run_dispatch(self, selected_passes):
-        settings = _dispatch_settings_from_node(self.node)
         selected_aovs = sorted(set().union(*(
             self.pass_aov_selections.get(path, set()) for path in selected_passes
         )))
@@ -3325,15 +3204,11 @@ class RenderDispatcherDialog(QtWidgets.QDialog if QtWidgets is not None else obj
                 self.node,
                 selected_aovs=selected_aovs,
                 selected_passes=selected_passes,
-                frame_start=settings.frame_start,
-                frame_end=settings.frame_end,
-                frame_step=settings.frame_step,
-                priority=settings.priority,
-                chunk_size=settings.chunk_size,
+                frame_start=self.frame_start.value(),
+                frame_end=self.frame_end.value(),
+                priority=self.priority.value(),
                 progress_callback=self._progress_dialog.update_progress,
-                enable_denoise=settings.enable_denoise,
-                denoise_chunk_size=settings.denoise_chunk_size,
-                publish_on_ayon=settings.publish_on_ayon,
+                enable_denoise=self.enable_denoise.isChecked(),
                 aovs_by_pass={
                     path: sorted(self.pass_aov_selections.get(path, set()))
                     for path in selected_passes

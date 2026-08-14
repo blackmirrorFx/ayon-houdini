@@ -1,0 +1,11 @@
+= BMFX Render Dispatcher =
+
+Connect this LOP after the render-setting and render-pass nodes. The node is a
+pass-through until a farm snapshot is prepared.
+
+Press **Preflight Check** to inspect the AOVs, passes and read-only output paths
+on the composed USD stage. Disable unwanted entries, set the Deadline farm
+parameters and press **Dispatch to Farm**.
+
+One filtered HIP snapshot and one Deadline job are created for each selected
+render pass. Camera and resolution stay controlled by BMFX Render Setting.

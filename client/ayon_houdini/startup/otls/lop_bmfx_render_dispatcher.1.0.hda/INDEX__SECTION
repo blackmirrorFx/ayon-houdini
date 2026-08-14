@@ -1,0 +1,14 @@
+Operator:     bmfx_render_dispatcher::1.0
+Label:        BMFX Render Dispatcher
+Path:         oplib:/Lop/bmfx_render_dispatcher::1.0?Lop/bmfx_render_dispatcher::1.0
+Icon:         opdef:/Lop/bmfx_render_dispatcher::1.0?IconSVG
+Table:        Lop
+License:      
+Extra:        
+User:         
+Inputs:       1 to 1
+Subnet:       true
+Python:       false
+Empty:        false
+Modified:     Fri Aug 14 14:57:52 2026
+

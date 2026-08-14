@@ -1,0 +1,140 @@
+"""Launch a Houdini ROP on Deadline with reliable native progress output."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+
+
+_PROGRESS_PATTERNS = (
+    re.compile(r"ALF_PROGRESS\s+(\d+)%"),
+    re.compile(r"RMAN_PROGRESS\s*(\d+)%"),
+    re.compile(r"Progress:\s*(\d+)%"),
+)
+
+
+def _emit_progress(percent):
+    percent = max(0, min(100, int(float(percent))))
+    print("Progress: {}%".format(percent), flush=True)
+
+
+def _apply_context_file(path):
+    """Restore the AYON/Houdini environment saved beside the farm HIP."""
+    if not path:
+        return
+    with open(path, "r") as stream:
+        payload = json.load(stream)
+    for section_name in ("launcher_env", "pipeline_env", "houdini_vars"):
+        for key, value in (payload.get(section_name) or {}).items():
+            if value is not None:
+                os.environ[str(key)] = str(value)
+
+
+def _worker(scene, rop_path, context_path, start, end, step):
+    _apply_context_file(context_path)
+    import hou
+
+    hou.hipFile.load(
+        scene,
+        suppress_save_prompt=True,
+        ignore_load_warnings=True,
+    )
+    rop = hou.node(rop_path)
+    if rop is None:
+        raise RuntimeError("USD Render ROP was not found: {}".format(rop_path))
+
+    _emit_progress(0)
+    # Deadline's stock hrender_dl.py omits these two keyword arguments. They
+    # are what ask Houdini to emit native ALF_PROGRESS lines during a render.
+    rop.render(
+        (float(start), float(end), float(step)),
+        ignore_inputs=False,
+        verbose=True,
+        output_progress=True,
+    )
+    _emit_progress(100)
+    return 0
+
+
+def _parent(hython, script_path, args):
+    _apply_context_file(args.context)
+    environment = os.environ.copy()
+    environment["PYTHONUNBUFFERED"] = "1"
+    command = [
+        hython,
+        script_path,
+        "--worker",
+        "--scene", args.scene,
+        "--rop", args.rop_path,
+        "--context", args.context,
+        "--start", str(args.start),
+        "--end", str(args.end),
+        "--step", str(args.step),
+    ]
+    print("Houdini render command: {}".format(" ".join(command)), flush=True)
+    process = subprocess.Popen(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+        env=environment,
+    )
+    assert process.stdout is not None
+    last_progress = None
+    for line in process.stdout:
+        line = line.rstrip("\r\n")
+        print(line, flush=True)
+        for pattern in _PROGRESS_PATTERNS:
+            match = pattern.search(line)
+            if not match:
+                continue
+            progress = max(0, min(100, int(match.group(1))))
+            if progress != last_progress and not line.startswith("Progress:"):
+                _emit_progress(progress)
+            last_progress = progress
+            break
+    return_code = process.wait()
+    if return_code:
+        raise RuntimeError(
+            "Houdini render failed with exit code {}.".format(return_code)
+        )
+    _emit_progress(100)
+    return 0
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--worker", action="store_true")
+    parser.add_argument("--hython")
+    parser.add_argument("--scene", required=True)
+    parser.add_argument("--rop", required=True, dest="rop_path")
+    parser.add_argument("--context", required=True)
+    parser.add_argument("--start", required=True, type=float)
+    parser.add_argument("--end", required=True, type=float)
+    parser.add_argument("--step", type=float, default=1.0)
+    args = parser.parse_args(argv)
+    if args.worker:
+        return _worker(
+            args.scene,
+            args.rop_path,
+            args.context,
+            args.start,
+            args.end,
+            args.step,
+        )
+    if not args.hython or not os.path.isfile(args.hython):
+        raise RuntimeError("Hython executable was not found: {}".format(args.hython))
+    return _parent(args.hython, os.path.abspath(__file__), args)
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except Exception as exc:
+        print("HOUDINI FARM RENDER ERROR: {}".format(exc), file=sys.stderr, flush=True)
+        raise
