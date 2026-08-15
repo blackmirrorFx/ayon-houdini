@@ -204,6 +204,34 @@ def _as_path_list(values, label):
     return result
 
 
+def _exclude_paths_not_hiding_targets(exclude_paths, target_paths):
+    """Drop exclusions that would remove an explicitly assigned target.
+
+    Target roles (beauty, phantom, or matte) take precedence over the generic
+    Exclude Target field.  An ancestor exclusion must also be removed when a
+    target below it is assigned, because USD collection exclusions apply to
+    the whole subtree.
+    """
+    result = []
+    for exclude_path in exclude_paths:
+        prefix = exclude_path.rstrip("/") + "/"
+        if any(
+            target_path == exclude_path or target_path.startswith(prefix)
+            for target_path in target_paths
+        ):
+            continue
+        result.append(exclude_path)
+    return result
+
+
+def _path_is_below_any_target(path, target_paths):
+    """Return whether ``path`` is a target or one of its descendants."""
+    for target_path in target_paths:
+        if path == target_path or path.startswith(target_path.rstrip("/") + "/"):
+            return True
+    return False
+
+
 def _layer_pass_names(pass_range, count):
     """Expand ``L200-L290`` to L200, L210, ... for ``count`` layers."""
     value = (pass_range or "").strip()
@@ -250,24 +278,6 @@ def _find_render_settings(stage):
     return sorted(candidates, key=lambda path: path.pathString)[0] if candidates else None
 
 
-def _material_paths(stage):
-    """Find material-library prims required by an isolated asset render.
-
-    The HDA selects asset Xforms, while material libraries normally live
-    elsewhere on the stage.  Keep these prims available for material binding
-    resolution.  Lights are deliberately *not* discovered here: the HDA's
-    Lights and Light Exclude menus are the sole source of light selection.
-    """
-    from pxr import UsdShade
-
-    paths = []
-    material_scope_names = {"material", "materials", "look", "looks", "shader", "shaders"}
-    for prim in stage.Traverse():
-        if prim.IsA(UsdShade.Material) or prim.GetName().lower() in material_scope_names:
-            paths.append(prim.GetPath().pathString)
-    return paths
-
-
 def _unselected_light_paths(stage, selected_light_paths):
     """Return concrete lights not below a selected light/menu target path."""
     from pxr import UsdLux
@@ -279,6 +289,28 @@ def _unselected_light_paths(stage, selected_light_paths):
             continue
         path = prim.GetPath().pathString
         if not any(path == selected or path.startswith(selected + "/") for selected in selected_light_paths):
+            result.append(path)
+    return result
+
+
+def _unassigned_renderable_paths(stage, assigned_paths):
+    """Return renderable geometry outside the explicitly assigned targets.
+
+    Isolation must operate on geometry prims instead of their asset ancestors.
+    An unselected asset can own materials or other dependencies used by an
+    assigned FX prim, and excluding the asset root would remove those too.
+    ``UsdGeom.Boundable`` covers meshes, curves, volumes, point instancers, and
+    renderer procedural geometry while lights are handled separately.
+    """
+    from pxr import UsdGeom, UsdLux
+
+    assigned_paths = _as_path_list(assigned_paths, "Render Target")
+    result = []
+    for prim in stage.Traverse():
+        if prim.HasAPI(UsdLux.LightAPI) or not prim.IsA(UsdGeom.Boundable):
+            continue
+        path = prim.GetPath().pathString
+        if not _path_is_below_any_target(path, assigned_paths):
             result.append(path)
     return result
 
@@ -305,9 +337,12 @@ def create_render_pass(stage, pass_name, beauty_paths, exclude_paths=(), phantom
     """Create one renderer-independent USD ``RenderPass``.
 
     Beauty objects are camera visible.  Phantom objects remain render-visible
-    but are excluded from camera visibility.  Matte objects are included in
-    the render and authored to the standard ``matte`` collection.  Excluded
-    objects are pruned from the pass.
+    but are excluded from camera visibility.  Matte objects are camera and
+    render visible, then authored to the standard ``matte`` collection.
+    Unassigned renderable geometry does not participate in the pass, while
+    non-geometry dependencies such as material libraries remain available.
+    Explicit target roles take precedence if the same object was also entered
+    in Exclude Target.
     """
     if stage is None:
         raise RuntimeError("An editable USD stage is required")
@@ -362,21 +397,49 @@ def create_render_pass(stage, pass_name, beauty_paths, exclude_paths=(), phantom
     if source_path:
         pass_schema.CreateRenderSourceRel().SetTargets([source_path])
 
-    material_paths = _material_paths(stage)
+    participating_paths = _as_path_list(
+        beauty_paths + phantom_paths + matte_paths,
+        "Render Target",
+    )
+    exclude_paths = _exclude_paths_not_hiding_targets(
+        exclude_paths,
+        participating_paths,
+    )
     light_excludes = _as_path_list(
         _unselected_light_paths(stage, light_paths) + light_exclude_paths,
         "Light Exclude",
     )
-    # Keep the complete stage renderable.  The camera collection below is the
-    # isolation mechanism; restricting render visibility to one asset removes
-    # the surrounding shading/light context and commonly produces black
-    # RenderMan renders.  Explicit excludes are still removed from all rays.
-    render_excludes = _as_path_list(exclude_paths + light_excludes, "Render Exclude")
-    _author_collection(pass_schema, "render", (), render_excludes, include_root=True)
-    # Material networks must survive camera population too; otherwise
-    # RenderMan can render the selected geometry as unshaded black.
-    camera_paths = _as_path_list(beauty_paths + material_paths, "Camera Target")
-    _author_collection(pass_schema, "camera", camera_paths, phantom_paths + render_excludes)
+    geometry_excludes = _as_path_list(
+        _unassigned_renderable_paths(stage, participating_paths),
+        "Unassigned Geometry",
+    )
+    # Start from the complete stage and remove only unassigned renderable
+    # geometry.  This preserves material libraries and asset ancestors even
+    # when an FX prim binds to a material owned by another department's asset.
+    render_excludes = _as_path_list(
+        geometry_excludes + exclude_paths + light_excludes,
+        "Render Exclude",
+    )
+    _author_collection(
+        pass_schema,
+        "render",
+        (),
+        render_excludes,
+        include_root=True,
+    )
+    # Camera visibility uses the same geometry isolation.  Matte objects stay
+    # camera-visible so the matte collection can turn them into holdouts.
+    phantom_excludes = _exclude_paths_not_hiding_targets(
+        phantom_paths,
+        beauty_paths + matte_paths,
+    )
+    _author_collection(
+        pass_schema,
+        "camera",
+        (),
+        geometry_excludes + phantom_excludes + exclude_paths + light_excludes,
+        include_root=True,
+    )
     _author_collection(pass_schema, "prune", render_excludes, ())
     _author_collection(pass_schema, "matte", matte_paths, ())
     return pass_path

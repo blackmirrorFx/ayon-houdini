@@ -1268,24 +1268,24 @@ def _set_renderman_ris_delegate(rop):
     return renderer_name
 
 
-def _set_render_progress_callbacks(rop):
-    """Install Deadline stdout progress callbacks on a USD Render ROP."""
-    callbacks = (
-        ("prerender", "on_dispatch_prerender"),
-        ("preframe", "on_preframe"),
-        ("postframe", "on_dispatch_postframe"),
-        ("postrender", "on_postrender"),
-    )
-    for event_name, function_name in callbacks:
+def _disable_render_event_scripts(rop):
+    """Keep dispatcher ROP progress independent of Houdini event scripts."""
+    for event_name in ("prerender", "preframe", "postframe", "postrender"):
         toggle_name = "t{}".format(event_name)
-        language_name = "l{}".format(event_name)
-        script = (
-            "import ayon_houdini.nodes.render as render; "
-            "render.{}()".format(function_name)
+        _set_first_parm(rop, (toggle_name,), 0)
+        _set_first_parm(rop, (event_name,), "")
+
+
+def _enable_native_render_progress(rop):
+    """Ask the USD Render ROP/Husk process to emit ALF progress records."""
+    # Houdini's own PDG ROP runner enables this parameter before cooking a
+    # render. On a USD Render ROP it adds Husk's Alfred verbosity flag (-Va),
+    # which produces the percentage records consumed by render_farm.py.
+    if not _set_first_parm(rop, ("alfprogress", "vm_alfprogress"), 1):
+        raise RuntimeError(
+            "USD Render ROP has no Alfred progress control; cannot report "
+            "reliable Deadline progress."
         )
-        _set_first_parm(rop, (toggle_name,), 1, required=True)
-        _set_first_parm(rop, (event_name,), script, required=True)
-        _set_first_parm(rop, (language_name,), "python", required=True)
 
 
 def _safe_pass_name(name):
@@ -1349,7 +1349,8 @@ def _create_usd_render_rop(
         if output_path:
             _set_output_override(rop, output_path)
         _set_renderman_ris_delegate(rop)
-        _set_render_progress_callbacks(rop)
+        _disable_render_event_scripts(rop)
+        _enable_native_render_progress(rop)
         _set_first_parm(rop, ("runcommand",), 1)
         _set_first_parm(rop, ("allframesatonce",), 0)
         _set_first_parm(rop, ("trange",), 1)
@@ -1995,6 +1996,48 @@ def _ayon_publish_session(context):
     return {key: value for key, value in session.items() if value}
 
 
+def _ayon_deadline_metadata(project_name):
+    """Return AYON's Deadline server identity for farm-publish metadata."""
+    deadline_data = {}
+    try:
+        from ayon_core.settings import get_project_settings
+
+        settings = get_project_settings(project_name).get("deadline") or {}
+        server_name = str(settings.get("deadline_server") or "").strip()
+        servers = (
+            settings.get("deadline_urls")
+            or settings.get("deadline_servers_info")
+            or []
+        )
+        if isinstance(servers, dict):
+            servers = [
+                dict(value, name=value.get("name") or name)
+                for name, value in servers.items()
+                if isinstance(value, dict)
+            ]
+        if not server_name and servers:
+            server_name = str(servers[0].get("name") or "").strip()
+        server_info = next(
+            (
+                item for item in servers
+                if str(item.get("name") or "").strip() == server_name
+            ),
+            {},
+        )
+        server_url = str(server_info.get("value") or "").strip().rstrip("/")
+        if server_name:
+            deadline_data["serverName"] = server_name
+        if server_url:
+            deadline_data["url"] = server_url
+    except Exception:
+        _LOGGER.warning(
+            "Could not resolve AYON Deadline server metadata for %s",
+            project_name,
+            exc_info=True,
+        )
+    return deadline_data
+
+
 def _write_ayon_publish_metadata(
     version_root,
     render_job_id,
@@ -2087,6 +2130,12 @@ def _write_ayon_publish_metadata(
         "stagingDir_persistent": True,
         "representations": representations,
         "publish": True,
+        # This dispatcher already authors the exact expected frame list. AYON
+        # must not query Deadline Web Service to recalculate it: the farm can
+        # use deadlinecommand even when that optional web service is offline.
+        "hasExplicitFrames": True,
+        "render_job_id": render_job_id,
+        "deadline": _ayon_deadline_metadata(context["project_name"]),
         "data": {
             "renderPass": pass_name,
             "renderPreset": preset,
@@ -2418,11 +2467,17 @@ def dispatch_to_deadline(
             }
             _add_pipeline_environment(job_info, start_index=2)
             render_arguments = " ".join((
+                _quoted_argument(render_python),
                 _quoted_argument(render_wrapper),
                 "--hython", _quoted_argument(hython_executable),
                 "--scene", _quoted_argument(hip_path),
                 "--rop", _quoted_argument(rop.path()),
                 "--context", _quoted_argument(context_path),
+                # Hashes avoid shell expansion of Houdini's $F token. The
+                # farm wrapper converts them back before setting outputimage.
+                "--output", _quoted_argument(
+                    _denoise_input_template(pass_output_path)
+                ),
                 "--start", "<STARTFRAME>",
                 "--end", "<ENDFRAME>",
                 "--step", str(frame_step),
@@ -2431,7 +2486,10 @@ def dispatch_to_deadline(
                 "Executable": render_python,
                 "Arguments": render_arguments,
                 "StartupDirectory": version_root,
-                "ShellExecute": False,
+                # Deadline's CommandLine plugin only routes stdout through its
+                # progress handler when using the managed shell process.
+                "ShellExecute": True,
+                "Shell": "default",
                 "SingleFramesOnly": False,
             }
             job_path = _write_info_file(
