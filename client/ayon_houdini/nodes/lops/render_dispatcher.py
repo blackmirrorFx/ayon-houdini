@@ -21,6 +21,7 @@ import re
 import shutil
 import socket
 import subprocess
+import sys
 import tempfile
 import uuid
 from datetime import datetime, timezone
@@ -172,6 +173,15 @@ class PassEntry:
     is_render_pass: bool = True
     preset: str = ""
     department: str = ""
+    kind: str = "render"
+    cryptomatte_paths: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class CryptomatteEntry:
+    path: str
+    layer: str = ""
+    source_output: str = ""
 
 
 @dataclass
@@ -192,6 +202,7 @@ class DispatchSettings:
     enable_denoise: bool = True
     denoise_chunk_size: int = 10
     publish_on_ayon: bool = True
+    enable_deep: bool = False
 
 
 def _require_houdini():
@@ -265,6 +276,7 @@ def _dispatch_settings_from_node(node):
             1, int(_eval_node_parm(node, "denoisechunks", 10))
         ),
         publish_on_ayon=bool(_eval_node_parm(node, "pubayon", 1)),
+        enable_deep=bool(_eval_node_parm(node, "dodeep", 0)),
     )
 
 
@@ -357,7 +369,11 @@ def _custom_data_string(prim, key):
 
 def _normalized_pass_preset(value, pass_name="", department=""):
     """Map Configure Render Pass presets to the two dispatcher products."""
+    if "cryptomatte" in str(value or "").strip().lower():
+        return "Cryptomatte"
     resolved_department = _pass_department(pass_name, department).lower()
+    if "cryptomatte" in resolved_department:
+        return "Cryptomatte"
     if "utility" in resolved_department:
         return "Utility"
     value = str(value or "").strip().lower()
@@ -396,8 +412,9 @@ def _render_output_name(pass_name, preset_name, department=""):
     safe_pass = _safe_pass_name(pass_name) or "render_pass"
     normalized_pass = safe_pass.lower().replace("_", "-")
     normalized_department = safe_department.lower().replace("_", "-")
-    if normalized_department and normalized_pass.endswith(
-        "-" + normalized_department
+    if normalized_department and (
+        normalized_pass == normalized_department
+        or normalized_pass.endswith("-" + normalized_department)
     ):
         safe_department = ""
     represented_tokens = {
@@ -500,6 +517,7 @@ def inspect_stage(stage) -> PreflightData:
     render_vars = {}
     render_settings = []
     render_passes = []
+    cryptomatte_prims = []
     product_to_vars = {}
 
     try:
@@ -535,6 +553,8 @@ def inspect_stage(stage) -> PreflightData:
             render_settings.append(path)
         elif type_name == "RenderPass":
             render_passes.append(prim)
+        elif "cryptomatte" in str(type_name).lower():
+            cryptomatte_prims.append(prim)
 
     used_var_paths = []
     products_by_var = {}
@@ -587,10 +607,69 @@ def inspect_stage(stage) -> PreflightData:
             )
         )
 
+    # A BMFX Cryptomatte Creator is a complete, independent render network:
+    # it authors PxrCryptomatte plus its own RenderSettings/RenderProduct. Add
+    # it as a dedicated selectable job instead of attaching it to Beauty.
+    cryptomatte_paths = {_prim_path(prim) for prim in cryptomatte_prims}
+    crypto_settings = {}
+    for settings_path in sorted(render_settings):
+        settings_prim = stage.GetPrimAtPath(settings_path)
+        targets = set()
+        if settings_prim and settings_prim.IsValid():
+            for relationship in settings_prim.GetRelationships():
+                try:
+                    targets.update(
+                        target.pathString for target in relationship.GetTargets()
+                    )
+                except Exception:
+                    continue
+        matched = tuple(sorted(cryptomatte_paths.intersection(targets)))
+        if matched:
+            crypto_settings[settings_path] = matched
+
+    # Older RenderMan schemas may not expose the sample-filter assignment as a
+    # relationship Houdini can query. A single settings prim in a crypto-only
+    # network is still unambiguous.
+    if cryptomatte_paths and not crypto_settings and len(render_settings) == 1:
+        crypto_settings[render_settings[0]] = tuple(sorted(cryptomatte_paths))
+
+    used_crypto_names = set()
+    for settings_path, prim_paths in sorted(crypto_settings.items()):
+        for index, crypto_path in enumerate(prim_paths):
+            crypto_prim = stage.GetPrimAtPath(crypto_path)
+            layer = _attribute_string(
+                crypto_prim,
+                ("inputs:ri:layer", "ri:layer", "inputs:layer", "layer"),
+            )
+            label = _cryptomatte_layer_label(
+                CryptomatteEntry(path=crypto_path, layer=layer),
+                index,
+                len(prim_paths),
+            )
+            name = "Cryptomatte"
+            if label:
+                name = "Cryptomatte-{}".format(label.title())
+            original_name = name
+            suffix = 2
+            while name.lower() in used_crypto_names:
+                name = "{}-{}".format(original_name, suffix)
+                suffix += 1
+            used_crypto_names.add(name.lower())
+            data.passes.append(PassEntry(
+                path=crypto_path,
+                name=name,
+                render_settings=settings_path,
+                is_render_pass=False,
+                preset="Cryptomatte",
+                department="Cryptomatte",
+                kind="cryptomatte",
+                cryptomatte_paths=(crypto_path,),
+            ))
+
     # RenderSettings are still valid jobs in scenes that do not use the newer
     # UsdRender.Pass schema.  Present them as passes so the workflow remains
     # useful for the current BMFX Render Setting HDA too.
-    if not data.passes:
+    if not render_passes and not crypto_settings:
         for path in sorted(render_settings):
             data.passes.append(
                 PassEntry(
@@ -603,7 +682,9 @@ def inspect_stage(stage) -> PreflightData:
 
     data.aovs.sort(key=lambda item: (item.name.lower(), item.path))
     data.output_paths = sorted(dict.fromkeys(data.output_paths))
-    if not data.aovs:
+    if not data.aovs and any(
+        entry.kind != "cryptomatte" for entry in data.passes
+    ):
         data.warnings.append("No connected RenderVars/AOVs were found.")
     if not data.passes:
         data.warnings.append("No RenderPass or RenderSettings prims were found.")
@@ -743,7 +824,10 @@ def _collect_required_preset_aovs(node, data):
             department=entry.department,
         )
         for entry in data.passes
+        if entry.kind != "cryptomatte"
     })
+    if not presets:
+        return data
     merged = {}
     try:
         for preset in presets:
@@ -956,13 +1040,200 @@ def _generated_pass_output_path(
     """Return the versioned dispatcher-owned EXR path for one render pass."""
     preset_name = preset_name or _render_preset_name(node)
     output_name = _render_output_name(pass_name, preset_name, department)
+    version_root = _render_version_dir(
+        node, pass_name, version=version, preset_name=preset_name,
+        department=department
+    )
+    return os.path.join(
+        version_root, "{}.$F4.exr".format(output_name)
+    ).replace("\\", "/")
+
+
+def _generated_deep_output_path(
+    node, pass_name, version=None, preset_name=None, department=""
+):
+    """Return the separate versioned Deep EXR sequence for a render pass."""
+    preset_name = preset_name or _render_preset_name(node)
+    output_name = _render_output_name(pass_name, preset_name, department)
     return os.path.join(
         _render_version_dir(
-            node, pass_name, version=version, preset_name=preset_name,
-            department=department
+            node,
+            pass_name,
+            version=version,
+            preset_name=preset_name,
+            department=department,
         ),
-        "{}.$F4.exr".format(output_name),
+        "deep",
+        "{}-Deep.$F4.exr".format(output_name),
     ).replace("\\", "/")
+
+
+def _cryptomatte_entries(stage):
+    """Return PxrCryptomatte sample-filter prims authored by creator HDAs."""
+    if stage is None:
+        return []
+    entries = []
+    for prim in stage.Traverse():
+        if "cryptomatte" not in str(prim.GetTypeName() or "").lower():
+            continue
+        entries.append(CryptomatteEntry(
+            path=_prim_path(prim),
+            layer=_attribute_string(
+                prim,
+                ("inputs:ri:layer", "ri:layer", "inputs:layer", "layer"),
+            ),
+            source_output=_attribute_string(
+                prim,
+                (
+                    "inputs:ri:filename", "ri:filename",
+                    "inputs:filename", "filename",
+                ),
+            ),
+        ))
+    return sorted(entries, key=lambda item: item.path)
+
+
+def _cryptomatte_creator_bindings(dispatcher_node):
+    """Return upstream Creator prim/filename parameter bindings.
+
+    The BMFX Creator exposes the USD prim through ``primpathcrypto`` and its
+    visible output field through ``xn__inputsrifilename_41ac``. Keeping this
+    parameter synchronized makes the farm HIP self-describing and avoids
+    relying exclusively on the worker-side USD override.
+    """
+    bindings = []
+    for upstream in _upstream_nodes(dispatcher_node):
+        prim_parm = upstream.parm("primpathcrypto")
+        filename_parm = upstream.parm("xn__inputsrifilename_41ac")
+        if prim_parm is None or filename_parm is None:
+            continue
+        try:
+            prim_path = prim_parm.evalAsString().strip()
+        except Exception:
+            prim_path = ""
+        if not prim_path:
+            continue
+        try:
+            original_filename = filename_parm.unexpandedString()
+        except Exception:
+            original_filename = filename_parm.evalAsString()
+        bindings.append({
+            "node": upstream,
+            "prim_path": prim_path,
+            "filename_parm": filename_parm,
+            "original_filename": original_filename,
+        })
+    return bindings
+
+
+def _restore_cryptomatte_creator_filenames(bindings):
+    for binding in bindings:
+        parm = binding["filename_parm"]
+        original = binding["original_filename"]
+        try:
+            current = parm.unexpandedString()
+        except Exception:
+            current = parm.evalAsString()
+        if current != original:
+            parm.set(original)
+
+
+def _sync_cryptomatte_creator_filenames(bindings, specs):
+    """Write dispatcher-owned version paths into matching Creator HDAs."""
+    outputs_by_prim = {
+        spec.get("prim_path"): spec.get("output_path")
+        for spec in specs
+        if spec.get("prim_path") and spec.get("output_path")
+    }
+    matched = set()
+    for binding in bindings:
+        output_path = outputs_by_prim.get(binding["prim_path"])
+        if not output_path:
+            continue
+        binding["filename_parm"].set(output_path)
+        matched.add(binding["prim_path"])
+    missing = sorted(set(outputs_by_prim).difference(matched))
+    if missing:
+        raise RuntimeError(
+            "Could not synchronize the Filename parameter on the BMFX "
+            "Cryptomatte Creator for: {}".format(", ".join(missing))
+        )
+
+
+def _cryptomatte_layer_label(entry, index, total):
+    """Return a filesystem/representation-safe label for one crypto layer."""
+    layer = str(entry.layer or "").strip().lower()
+    aliases = {
+        "identifier:name": "path",
+        "identifier:object": "object",
+        "user:__materialid": "material",
+    }
+    label = aliases.get(layer, layer.rsplit(":", 1)[-1])
+    label = re.sub(r"[^a-z0-9]+", "_", label).strip("_")
+    if not label:
+        label = re.sub(
+            r"[^a-z0-9]+", "_", entry.path.rsplit("/", 1)[-1].lower()
+        ).strip("_")
+    if not label:
+        label = "layer{:02d}".format(index + 1)
+    return label if total > 1 else ""
+
+
+def _generated_cryptomatte_specs(
+    node, pass_name, entries, version=None, preset_name=None, department="",
+    standalone=False,
+):
+    """Return versioned outputs for every connected Cryptomatte creator."""
+    preset_name = preset_name or _render_preset_name(node)
+    output_name = _render_output_name(pass_name, preset_name, department)
+    version_root = _render_version_dir(
+        node,
+        pass_name,
+        version=version,
+        preset_name=preset_name,
+        department=department,
+    )
+    specs = []
+    total = len(entries)
+    used_names = set()
+    for index, entry in enumerate(entries):
+        label = _cryptomatte_layer_label(entry, index, total)
+        representation = "cryptomatte"
+        filename_suffix = "Cryptomatte"
+        if label:
+            representation = "cryptomatte_{}".format(label)
+            filename_suffix = "Cryptomatte-{}".format(label.title())
+        unique_name = representation
+        counter = 2
+        while unique_name in used_names:
+            unique_name = "{}_{}".format(representation, counter)
+            counter += 1
+        used_names.add(unique_name)
+        if unique_name != representation:
+            filename_suffix += "-{}".format(counter - 1)
+        if standalone and total == 1:
+            output_path = _generated_pass_output_path(
+                node,
+                pass_name,
+                version=version,
+                preset_name=preset_name,
+                department=department,
+            )
+        else:
+            output_path = os.path.join(
+                version_root,
+                "cryptomatte",
+                "{}-{}.$F4.exr".format(output_name, filename_suffix),
+            ).replace("\\", "/")
+        specs.append({
+            "prim_path": entry.path,
+            "layer": entry.layer,
+            "source_output": entry.source_output,
+            "representation": unique_name,
+            "output_name": unique_name,
+            "output_path": output_path,
+        })
+    return specs
 
 
 def collect_preflight(node_or_kwargs=None) -> PreflightData:
@@ -1000,7 +1271,9 @@ def validate_preflight(
     issues = []
     if not data.passes:
         issues.append(("error", "No RenderPass or RenderSettings prim was found."))
-    if not data.aovs:
+    if not data.aovs and any(
+        entry.kind != "cryptomatte" for entry in data.passes
+    ):
         issues.append(("error", "No connected RenderVar/AOV was found."))
     if not shutil.which("deadlinecommand"):
         issues.append(("error", "deadlinecommand is not available in PATH."))
@@ -1129,7 +1402,15 @@ def validate_preflight(
 
     issues.extend(("warning", warning) for warning in data.warnings)
     if not issues:
-        issues.append(("ok", "Preflight passed. The dispatcher is ready."))
+        message = "Preflight passed. The dispatcher is ready."
+        cryptomatte_count = sum(
+            entry.kind == "cryptomatte" for entry in data.passes
+        )
+        if cryptomatte_count:
+            message += " {} independent Cryptomatte job{} detected.".format(
+                cryptomatte_count, "" if cryptomatte_count == 1 else "s"
+            )
+        issues.append(("ok", message))
     return issues
 
 
@@ -1142,6 +1423,29 @@ def _json_parm(node, name):
     except (TypeError, ValueError):
         return []
     return [str(item) for item in value] if isinstance(value, list) else []
+
+
+def _reset_dispatcher_filter(node, cook=True):
+    """Restore the artist-facing dispatcher to a true pass-through state."""
+    if node is None:
+        return
+    neutral_values = {
+        _FILTER_ACTIVE_PARM: 0,
+        _SELECTED_AOVS_PARM: "[]",
+        _SELECTED_PASSES_PARM: "[]",
+    }
+    changed = False
+    for name, value in neutral_values.items():
+        parm = node.parm(name)
+        if parm is None:
+            continue
+        try:
+            parm.set(value)
+            changed = True
+        except Exception:
+            _LOGGER.exception("Could not reset dispatcher parameter %s", name)
+    if cook and changed:
+        node.cook(force=True)
 
 
 def cook_dispatcher_stage(python_lop=None, settings_node=None):
@@ -1164,9 +1468,20 @@ def cook_dispatcher_stage(python_lop=None, settings_node=None):
     if stage is None:
         raise RuntimeError("Render Dispatcher could not acquire an editable stage.")
 
+    cryptomatte_paths = {
+        _prim_path(prim)
+        for prim in stage.Traverse()
+        if "cryptomatte" in str(prim.GetTypeName() or "").lower()
+    }
+    selected_cryptomattes = selected_passes.intersection(cryptomatte_paths)
+    cryptomatte_job = bool(selected_cryptomattes)
+
     for prim in stage.Traverse():
         type_name = prim.GetTypeName() or ""
         if type_name == "RenderProduct":
+            if cryptomatte_job:
+                # Keep the Creator HDA's own RenderProduct exactly as authored.
+                continue
             relationship = prim.GetRelationship("orderedVars")
             if relationship:
                 targets = relationship.GetTargets()
@@ -1176,6 +1491,24 @@ def cook_dispatcher_stage(python_lop=None, settings_node=None):
         elif type_name == "RenderPass" and selected_passes:
             if _prim_path(prim) not in selected_passes:
                 prim.SetActive(False)
+        elif "cryptomatte" in str(type_name).lower():
+            if _prim_path(prim) not in selected_cryptomattes:
+                prim.SetActive(False)
+
+        if type_name == "RenderSettings":
+            # Remove Cryptomatte sample filters from every non-Cryptomatte
+            # render, and isolate the requested Creator in a crypto job.
+            for relationship in prim.GetRelationships():
+                if "samplefilter" not in relationship.GetName().lower():
+                    continue
+                targets = relationship.GetTargets()
+                relationship.SetTargets([
+                    target for target in targets
+                    if (
+                        target.pathString not in cryptomatte_paths
+                        or target.pathString in selected_cryptomattes
+                    )
+                ])
 
 
 def _deadline_values(kind):
@@ -1288,8 +1621,27 @@ def _enable_native_render_progress(rop):
         )
 
 
+def _enable_delegate_products(rop):
+    """Allow Husk to pass non-raster products such as Deep EXR to HdPrman."""
+    # Delegate Products is enabled by default on current USD Render ROPs. Set
+    # it explicitly when the parameter is exposed so the generated Husk
+    # command can never add --disable-delegate-products.
+    _set_first_parm(rop, ("delegateproducts",), 1)
+
+
 def _safe_pass_name(name):
     return re.sub(r"[^A-Za-z0-9_.-]+", "_", str(name or "")).strip("_")
+
+
+def _new_package_id():
+    """Return an immutable studio correlation id for one dispatched package."""
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    return "BMFX-{}-{}".format(stamp, uuid.uuid4().hex[:12].upper())
+
+
+def _new_execution_id():
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    return "BMFX-EXEC-{}-{}".format(stamp, uuid.uuid4().hex[:12].upper())
 
 
 def _create_usd_render_rop(
@@ -1349,6 +1701,7 @@ def _create_usd_render_rop(
         if output_path:
             _set_output_override(rop, output_path)
         _set_renderman_ris_delegate(rop)
+        _enable_delegate_products(rop)
         _disable_render_event_scripts(rop)
         _enable_native_render_progress(rop)
         _set_first_parm(rop, ("runcommand",), 1)
@@ -1370,7 +1723,16 @@ def _pipeline_environment():
     """Return farm paths with the local ``ayon_houdini`` parent guaranteed."""
     environment = {
         key: os.environ[key]
-        for key in ("PYTHONPATH", "HOUDINI_PATH", "HOUDINI_OTLSCAN_PATH")
+        for key in (
+            "PYTHONPATH",
+            "HOUDINI_PATH",
+            "HOUDINI_OTLSCAN_PATH",
+            # Carry Discord notification configuration through .ayon_vars.json
+            # and Deadline's job environment for this private pipeline.
+            "BMFX_DISCORD_USER_ID",
+            "BMFX_DISCORD_BOT_TOKEN",
+            "BMFX_DISCORD_API_BASE",
+        )
         if os.environ.get(key)
     }
 
@@ -1512,6 +1874,16 @@ def _write_ayon_context(root):
     return path
 
 
+def _write_cryptomatte_map(root, specs):
+    """Store exact creator-prim/output mappings for the farm render worker."""
+    if not specs:
+        return ""
+    path = os.path.join(root, ".cryptomatte_outputs.json")
+    with open(path, "w") as stream:
+        json.dump({"cryptomattes": specs}, stream, indent=2, sort_keys=True)
+    return path
+
+
 def _add_pipeline_environment(job_info, start_index=1):
     """Put import/HDA paths in the process environment before Houdini starts."""
     index = int(start_index)
@@ -1545,6 +1917,27 @@ def _write_submission_manifest(root, payload):
     return path
 
 
+def _render_report_metadata(node, settings_path):
+    """Read report-safe metadata from the authored USD RenderSettings prim."""
+    result = {}
+    try:
+        stage = _resolve_stage(node)
+        prim = stage.GetPrimAtPath(str(settings_path or ""))
+        if not prim or not prim.IsValid():
+            return result
+        resolution = prim.GetAttribute("resolution").Get()
+        if resolution and len(resolution) >= 2:
+            result["resolution"] = [int(resolution[0]), int(resolution[1])]
+        pixel_aspect = prim.GetAttribute("pixelAspectRatio").Get()
+        if pixel_aspect is not None:
+            result["pixel_aspect_ratio"] = float(pixel_aspect)
+    except Exception:
+        _LOGGER.debug(
+            "Could not read USD RenderSettings report metadata", exc_info=True
+        )
+    return result
+
+
 def _manifest_ayon_context():
     """Return the readable AYON project/folder/task context for the manifest."""
     try:
@@ -1559,6 +1952,28 @@ def _manifest_ayon_context():
         "task_name": context.get("task_name") or os.getenv("AYON_TASK_NAME", ""),
         "task_type": context.get("task_type") or os.getenv("AYON_TASK_TYPE", ""),
     }
+
+
+def _deadline_batch_name(pass_name):
+    """Return the shared Deadline group name for one render-layer chain."""
+    context = _manifest_ayon_context()
+    folder_path = str(context.get("folder_path") or "").rstrip("/\\")
+    shot_name = (
+        os.getenv("SHOT")
+        or os.getenv("AYON_SHOT_NAME")
+        or os.path.basename(folder_path)
+        or "UnknownShot"
+    )
+    values = (
+        context.get("project_name") or "UnknownProject",
+        shot_name,
+        context.get("task_name") or "UnknownTask",
+        pass_name or "RenderLayer",
+    )
+    return " | ".join(
+        re.sub(r"\s*\|\s*", "-", str(value)).strip()
+        for value in values
+    )
 
 
 def _manifest_software_versions():
@@ -1689,11 +2104,95 @@ def _denoise_input_template(output_path):
     return value
 
 
+def _submit_deep_holdout_job(
+    deadline_command,
+    version_root,
+    render_job_name,
+    batch_name,
+    render_python,
+    render_wrapper,
+    hython_executable,
+    hip_path,
+    rop_path,
+    context_path,
+    output_path,
+    deadline_frames,
+    frame_step,
+    pool,
+    group,
+    priority,
+    chunk_size,
+    machine_limit,
+    version,
+):
+    """Submit a parallel RenderMan RIS Deep EXR job for Nuke holdouts."""
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    job_info = {
+        "Plugin": "CommandLine",
+        "Name": "{} | Deep".format(render_job_name),
+        "BatchName": batch_name,
+        "Frames": deadline_frames,
+        "ChunkSize": max(1, int(chunk_size)),
+        "Pool": pool.strip(),
+        "Group": group.strip(),
+        "Priority": priority,
+        "EnvironmentKeyValue0": "AYON_CONTEXT_JSON={}".format(context_path),
+        "EnvironmentKeyValue1": "BMFX_RENDER_VERSION={}".format(version),
+        "MachineLimit": machine_limit or None,
+        "OutputFilename0": output_path,
+    }
+    _add_pipeline_environment(job_info, start_index=2)
+    arguments = " ".join((
+        _quoted_argument(render_python),
+        _quoted_argument(render_wrapper),
+        "--hython", _quoted_argument(hython_executable),
+        "--scene", _quoted_argument(hip_path),
+        "--rop", _quoted_argument(rop_path),
+        "--context", _quoted_argument(context_path),
+        "--output", _quoted_argument(_denoise_input_template(output_path)),
+        "--start", "<STARTFRAME>",
+        "--end", "<ENDFRAME>",
+        "--step", str(frame_step),
+        "--deep",
+    ))
+    plugin_info = {
+        "Executable": render_python,
+        "Arguments": arguments,
+        "StartupDirectory": version_root,
+        "ShellExecute": True,
+        "Shell": "default",
+        "SingleFramesOnly": False,
+    }
+    job_path = _write_info_file(
+        version_root, "deadline_deep_job.info", job_info
+    )
+    plugin_path = _write_info_file(
+        version_root, "deadline_deep_plugin.info", plugin_info
+    )
+    try:
+        job_id = _submit_deadline_files(
+            deadline_command, job_path, plugin_path
+        )
+    finally:
+        _remove_submission_info_files(job_path, plugin_path)
+    return {
+        "enabled": True,
+        "job_id": job_id,
+        "job_name": job_info["Name"],
+        "output_path": output_path,
+        "product_type": "deepexr",
+        "driver": "deepexr",
+        "channels": ["Ci", "alpha", "deep.front", "deep.back"],
+        "denoised": False,
+    }
+
+
 def _submit_denoise_job(
     deadline_command,
     version_root,
     render_job_id,
     render_job_name,
+    batch_name,
     input_path,
     frame_start,
     frame_end,
@@ -1737,7 +2236,8 @@ def _submit_denoise_job(
     ))
     job_info = {
         "Plugin": "CommandLine",
-        "Name": "{}-Denoise".format(render_job_name),
+        "Name": "{} | Denoise".format(render_job_name),
+        "BatchName": batch_name,
         "Frames": "{}-{}".format(int(frame_start), int(frame_end)),
         "ChunkSize": max(1, int(chunk_size)),
         "Pool": pool.strip(),
@@ -1777,7 +2277,8 @@ def _submit_denoise_job(
     ))
     finalize_job_info = {
         "Plugin": "CommandLine",
-        "Name": "{}-DenoiseFinalize".format(render_job_name),
+        "Name": "{} | Denoise Finalize".format(render_job_name),
+        "BatchName": batch_name,
         "Frames": "0",
         "ChunkSize": 1,
         "Pool": pool.strip(),
@@ -1844,6 +2345,7 @@ def _submit_review_media_job(
     version_root,
     dependency_job_ids,
     render_job_name,
+    batch_name,
     input_path,
     frame_start,
     frame_end,
@@ -1893,7 +2395,8 @@ def _submit_review_media_job(
     ))
     job_info = {
         "Plugin": "CommandLine",
-        "Name": "{}-ReviewMedia".format(render_job_name),
+        "Name": "{} | Review Media".format(render_job_name),
+        "BatchName": batch_name,
         "Frames": "0",
         "ChunkSize": 1,
         "Pool": pool.strip(),
@@ -2052,6 +2555,12 @@ def _write_ayon_publish_metadata(
     pass_name,
     preset,
     department,
+    deep_holdout=None,
+    cryptomatte=None,
+    cryptomatte_only=False,
+    package_id="",
+    execution_id="",
+    scene_dependencies=None,
 ):
     """Write AYON farm-publish metadata with loadable representations."""
     context = _manifest_ayon_context()
@@ -2075,18 +2584,89 @@ def _write_ayon_publish_metadata(
     frame_step = max(1, int(frame_step))
     fps = float(hou.fps())
     output_directory = os.path.dirname(output_path)
-    representations = [{
-        "name": "exr",
-        "ext": "exr",
-        "files": _render_sequence_filenames(
-            output_path, frame_start, frame_end, frame_step
-        ),
-        "stagingDir": output_directory,
-        "stagingDir_persistent": True,
-        "frameStart": frame_start,
-        "frameEnd": frame_end,
-        "tags": [],
-    }]
+    representations = []
+    if source_hip and os.path.isfile(source_hip):
+        hip_extension = os.path.splitext(source_hip)[1].lstrip(".") or "hip"
+        representations.append({
+            "name": "source",
+            "ext": hip_extension,
+            "files": os.path.basename(source_hip),
+            "stagingDir": os.path.dirname(source_hip),
+            "stagingDir_persistent": True,
+            "tags": ["source", "workfile"],
+            "data": {
+                "role": "sourceScene",
+                "application": "houdini",
+            },
+        })
+    if not cryptomatte_only:
+        representations.append({
+            "name": "exr",
+            "ext": "exr",
+            "files": _render_sequence_filenames(
+                output_path, frame_start, frame_end, frame_step
+            ),
+            "stagingDir": output_directory,
+            "stagingDir_persistent": True,
+            "frameStart": frame_start,
+            "frameEnd": frame_end,
+            "tags": [],
+        })
+    deep_holdout = deep_holdout or {}
+    deep_output_path = deep_holdout.get("output_path")
+    if deep_holdout.get("enabled") and deep_output_path:
+        representations.append({
+            "name": "deep",
+            "ext": "exr",
+            # AYON's optional {output} anatomy field gives this EXR a unique
+            # destination while it remains a representation of the same
+            # render product/version as Beauty.
+            "outputName": "deep",
+            "files": _render_sequence_filenames(
+                deep_output_path, frame_start, frame_end, frame_step
+            ),
+            "stagingDir": os.path.dirname(deep_output_path),
+            "stagingDir_persistent": True,
+            "frameStart": frame_start,
+            "frameEnd": frame_end,
+            "tags": ["deep"],
+            "data": {
+                "deep": True,
+                "purpose": "holdout",
+                "colorspace": "data",
+                "sourceRenderJobId": (
+                    deep_holdout.get("job_id") or render_job_id
+                ),
+            },
+        })
+    cryptomatte = cryptomatte or {}
+    for spec in cryptomatte.get("outputs") or []:
+        crypto_output_path = spec.get("output_path")
+        representation_name = spec.get("representation") or "cryptomatte"
+        if not crypto_output_path:
+            continue
+        representations.append({
+            "name": representation_name,
+            "ext": "exr",
+            "outputName": spec.get("output_name") or representation_name,
+            "files": _render_sequence_filenames(
+                crypto_output_path, frame_start, frame_end, frame_step
+            ),
+            "stagingDir": os.path.dirname(crypto_output_path),
+            "stagingDir_persistent": True,
+            "frameStart": frame_start,
+            "frameEnd": frame_end,
+            "tags": ["cryptomatte"],
+            "data": {
+                "cryptomatte": True,
+                "colorspace": "data",
+                "layer": spec.get("layer") or "",
+                "creatorPrim": spec.get("prim_path") or "",
+                "sourceRenderJobId": (
+                    cryptomatte.get("job_id") or render_job_id
+                ),
+            },
+        })
     if review_media.get("enabled"):
         for name in ("mov", "mp4"):
             media = review_media.get(name) or {}
@@ -2106,6 +2686,24 @@ def _write_ayon_publish_metadata(
                 },
             })
 
+    resource_kinds = {
+        "exr": "render", "jpg": "render", "jpeg": "render",
+        "png": "render", "mov": "playblast", "mp4": "playblast",
+        "usd": "usd", "usda": "usd", "usdc": "usd",
+        "bgeo": "bgeo", "bgeo.sc": "bgeo", "abc": "alembic",
+        "vdb": "vdb",
+    }
+    for representation in representations:
+        extension = str(
+            representation.get("ext") or representation.get("name") or ""
+        ).lower().lstrip(".")
+        representation.setdefault("data", {}).setdefault(
+            "bmfxResourceKind", resource_kinds.get(extension, "other")
+        )
+
+    scene_dependencies = scene_dependencies or {
+        "schema_version": 1, "records": [], "input_versions": []
+    }
     instance = {
         "name": product_name,
         "label": "{} v{:03d}".format(pass_name, int(version)),
@@ -2129,6 +2727,16 @@ def _write_ayon_publish_metadata(
         "stagingDir": output_directory,
         "stagingDir_persistent": True,
         "representations": representations,
+        # AYON's standard IntegrateInputLinks plugin converts these into
+        # durable version-to-version links after the farm publish succeeds.
+        "inputVersions": list(scene_dependencies.get("input_versions") or []),
+        "versionData": {
+            "bmfxPackageId": package_id,
+            "bmfxExecutionId": execution_id,
+            "bmfxUidSchema": 1,
+            "bmfxKind": "render",
+            "bmfxSceneDependencies": scene_dependencies,
+        },
         "publish": True,
         # This dispatcher already authors the exact expected frame list. AYON
         # must not query Deadline Web Service to recalculate it: the farm can
@@ -2137,12 +2745,19 @@ def _write_ayon_publish_metadata(
         "render_job_id": render_job_id,
         "deadline": _ayon_deadline_metadata(context["project_name"]),
         "data": {
+            "bmfxPackageId": package_id,
+            "bmfxKind": "render",
             "renderPass": pass_name,
             "renderPreset": preset,
             "renderDepartment": department,
+            "deepHoldout": bool(deep_holdout.get("enabled")),
+            "cryptomatte": bool(cryptomatte.get("enabled")),
+            "sceneDependencies": scene_dependencies,
         },
     }
     payload = {
+        "bmfxPackageId": package_id,
+        "bmfxExecutionId": execution_id,
         "folderPath": context["folder_path"],
         "frameStart": frame_start,
         "frameEnd": frame_end,
@@ -2154,6 +2769,7 @@ def _write_ayon_publish_metadata(
         "instances": [instance],
         "version": int(version),
         "session": _ayon_publish_session(context),
+        "sceneDependencies": scene_dependencies,
     }
     path = os.path.join(version_root, "ayon_publish_metadata.json")
     with open(path, "w") as stream:
@@ -2167,6 +2783,7 @@ def _submit_ayon_publish_job(
     dependency_job_id,
     render_job_id,
     render_job_name,
+    batch_name,
     product_name,
     version,
     source_hip,
@@ -2178,9 +2795,15 @@ def _submit_ayon_publish_job(
     pass_name,
     preset,
     department,
+    deep_holdout,
+    cryptomatte,
+    cryptomatte_only,
     pool,
     group,
     priority,
+    package_id,
+    execution_id,
+    scene_dependencies=None,
 ):
     """Submit AYON's supported headless publisher after farm outputs exist."""
     metadata_path, metadata = _write_ayon_publish_metadata(
@@ -2197,10 +2820,17 @@ def _submit_ayon_publish_job(
         pass_name=pass_name,
         preset=preset,
         department=department,
+        deep_holdout=deep_holdout,
+        cryptomatte=cryptomatte,
+        cryptomatte_only=cryptomatte_only,
+        package_id=package_id,
+        execution_id=execution_id,
+        scene_dependencies=scene_dependencies,
     )
     job_info = {
         "Plugin": "Ayon",
-        "Name": "{}-AYON-Publish".format(render_job_name),
+        "Name": "{} | AYON Publish".format(render_job_name),
+        "BatchName": batch_name,
         "Frames": "0",
         "ChunkSize": 1,
         "Pool": pool.strip(),
@@ -2208,8 +2838,11 @@ def _submit_ayon_publish_job(
         "Priority": priority,
         "JobDependencies": dependency_job_id,
         "OutputDirectory0": version_root,
+        "ExtraInfo0": package_id,
     }
     environment = _farm_environment()
+    environment["BMFX_PACKAGE_ID"] = package_id
+    environment["BMFX_EXECUTION_ID"] = execution_id
     environment.update(metadata["session"])
     # The Deadline Ayon plugin prefers a job-level API key over its repository
     # configuration. Our farm currently has a stale configured key, while the
@@ -2255,7 +2888,11 @@ def _submit_ayon_publish_job(
         "version": int(version),
         "representations": [
             representation["name"]
-            for representation in metadata["instances"][0]["representations"]
+            for instance in metadata["instances"]
+            for representation in instance["representations"]
+        ],
+        "products": [
+            instance["productName"] for instance in metadata["instances"]
         ],
     }
 
@@ -2301,6 +2938,8 @@ def dispatch_to_deadline(
     enable_denoise=True,
     denoise_chunk_size=10,
     publish_on_ayon=True,
+    enable_deep=False,
+    discord_notify=True,
 ):
     """Submit one filtered HIP snapshot per selected pass to Deadline."""
     node = _resolve_node(node_or_kwargs)
@@ -2310,6 +2949,9 @@ def dispatch_to_deadline(
     if not deadline_command:
         raise RuntimeError("deadlinecommand was not found in PATH.")
 
+    # Recover older scenes (or interrupted submissions) whose hidden farm
+    # filter was accidentally saved as active before inspecting the stage.
+    _reset_dispatcher_filter(node)
     preflight = collect_preflight(node)
     passes_by_path = {entry.path: entry for entry in preflight.passes}
     selected_pass_entries = [
@@ -2320,7 +2962,9 @@ def dispatch_to_deadline(
     selected_aovs = [path for path in selected_aovs if path in known_aovs]
     if not selected_pass_entries:
         raise RuntimeError("Select at least one render pass.")
-    if not selected_aovs:
+    if not selected_aovs and any(
+        entry.kind != "cryptomatte" for entry in selected_pass_entries
+    ):
         raise RuntimeError("Select at least one AOV.")
 
     frame_start = int(frame_start)
@@ -2353,11 +2997,6 @@ def dispatch_to_deadline(
     if frame_step != 1:
         deadline_frames += "x{}".format(frame_step)
 
-    hidden_parms = {
-        name: node.parm(name).eval()
-        for name in (_FILTER_ACTIVE_PARM, _SELECTED_AOVS_PARM, _SELECTED_PASSES_PARM)
-        if node.parm(name) is not None
-    }
     render_setting_node = _render_setting_node(node)
     render_setting_parm = (
         render_setting_node.parm("varType") if render_setting_node else None
@@ -2369,25 +3008,45 @@ def dispatch_to_deadline(
         original_working_hip = hou.hipFile.path()
     except Exception:
         original_working_hip = ""
+    try:
+        from ..scene_dependencies import collect_scene_dependencies
+    except (ImportError, ValueError):
+        from nodes.scene_dependencies import collect_scene_dependencies
+    scene_dependencies = collect_scene_dependencies(
+        project_name=(_manifest_ayon_context().get("project_name") or ""),
+        stage=_resolve_stage(node),
+        hou_module=hou,
+    )
+    _LOGGER.info(
+        "Collected %d scene dependencies (%d AYON versions)",
+        len(scene_dependencies.get("records") or []),
+        len(scene_dependencies.get("input_version_ids") or []),
+    )
+    cryptomatte_creator_bindings = _cryptomatte_creator_bindings(node)
     submitted = []
     submission_records = []
+    execution_id = _new_execution_id()
     rops = []
     try:
-        node.parm(_FILTER_ACTIVE_PARM).set(1)
-        node.parm(_SELECTED_AOVS_PARM).set(json.dumps(selected_aovs))
         total_passes = len(selected_pass_entries)
         for pass_index, pass_entry in enumerate(selected_pass_entries):
+            # Each farm snapshot starts from the artist-authored Creator path.
+            # Only the dedicated Cryptomatte snapshot receives an override.
+            _restore_cryptomatte_creator_filenames(
+                cryptomatte_creator_bindings
+            )
+            is_cryptomatte_job = pass_entry.kind == "cryptomatte"
             pass_preset = _normalized_pass_preset(
                 pass_entry.preset,
                 pass_name=pass_entry.name,
                 department=pass_entry.department,
             )
-            if render_setting_node is not None:
+            if render_setting_node is not None and not is_cryptomatte_job:
                 _apply_render_setting_preset(render_setting_node, pass_preset)
                 node.cook(force=True)
             pass_aovs = list((aovs_by_pass or {}).get(pass_entry.path, selected_aovs))
             pass_aovs = [path for path in pass_aovs if path in known_aovs]
-            if not pass_aovs:
+            if not pass_aovs and not is_cryptomatte_job:
                 raise RuntimeError(
                     "Render pass {} has no selected AOVs.".format(pass_entry.name)
                 )
@@ -2395,15 +3054,30 @@ def dispatch_to_deadline(
                 progress_callback, pass_entry, pass_index, total_passes,
                 "Preparing", 10
             )
+            # Turn on farm filtering only while authoring this pass snapshot.
+            node.parm(_FILTER_ACTIVE_PARM).set(1)
             node.parm(_SELECTED_AOVS_PARM).set(json.dumps(pass_aovs))
             node.parm(_SELECTED_PASSES_PARM).set(json.dumps([pass_entry.path]))
             node.cook(force=True)
+            cryptomatte_entries = []
+            if is_cryptomatte_job:
+                wanted_cryptomattes = set(pass_entry.cryptomatte_paths)
+                cryptomatte_entries = [
+                    entry for entry in _cryptomatte_entries(_resolve_stage(node))
+                    if entry.path in wanted_cryptomattes
+                ]
+                if not cryptomatte_entries:
+                    raise RuntimeError(
+                        "Cryptomatte Creator prim is unavailable after filtering: {}"
+                        .format(pass_entry.path)
+                    )
             version, version_root = _reserve_render_version(
                 node,
                 pass_entry.name,
                 preset_name=pass_preset,
                 department=pass_entry.department,
             )
+            package_id = _new_package_id()
             pass_output_path = _generated_pass_output_path(
                 node,
                 pass_entry.name,
@@ -2412,14 +3086,61 @@ def dispatch_to_deadline(
                 department=pass_entry.department,
             )
             os.makedirs(os.path.dirname(pass_output_path), exist_ok=True)
+            render_driver_output_path = pass_output_path
+            if is_cryptomatte_job:
+                # The Creator HDA owns the only Cryptomatte output. Do not
+                # author an outputimage override on the USD Render ROP.
+                render_driver_output_path = ""
+            deep_output_path = ""
+            if enable_deep and pass_preset == "Beauty" and not is_cryptomatte_job:
+                deep_output_path = _generated_deep_output_path(
+                    node,
+                    pass_entry.name,
+                    version=version,
+                    preset_name=pass_preset,
+                    department=pass_entry.department,
+                )
+                os.makedirs(os.path.dirname(deep_output_path), exist_ok=True)
+            cryptomatte_specs = _generated_cryptomatte_specs(
+                node,
+                pass_entry.name,
+                cryptomatte_entries,
+                version=version,
+                preset_name=pass_preset,
+                department=pass_entry.department,
+                standalone=is_cryptomatte_job,
+            )
+            # RenderMan's Cryptomatte filter will not create its parent folder.
+            # It must exist before the Creator HDA is assigned and recooked.
+            for spec in cryptomatte_specs:
+                os.makedirs(os.path.dirname(spec["output_path"]), exist_ok=True)
+            if is_cryptomatte_job:
+                # The Cryptomatte sequence is this job's primary deliverable.
+                # Keep preview/versioning and farm validation on one path.
+                pass_output_path = cryptomatte_specs[0]["output_path"]
+                _sync_cryptomatte_creator_filenames(
+                    cryptomatte_creator_bindings, cryptomatte_specs
+                )
+                # Recook after changing the upstream HDA so both its visible
+                # parameter and the authored inputs:ri:filename agree in the
+                # saved farm scene.
+                node.cook(force=True)
             context_path = _write_ayon_context(version_root)
+            metrics_root = os.path.join(version_root, "metrics")
+            os.makedirs(metrics_root, exist_ok=True)
+            metrics_path = os.path.join(
+                metrics_root, "frame_<STARTFRAME>.json"
+            ).replace("\\", "/")
+            cryptomatte_map_path = _write_cryptomatte_map(
+                version_root, cryptomatte_specs
+            )
             rop = _create_usd_render_rop(
                 node,
                 pass_entry,
                 frame_start,
                 frame_end,
                 frame_step=frame_step,
-                output_path=pass_output_path,
+                output_path=render_driver_output_path,
             )
             rops.append(rop)
 
@@ -2427,12 +3148,21 @@ def dispatch_to_deadline(
                 progress_callback, pass_entry, pass_index, total_passes,
                 "Saving Farm Scene", 45, version=version
             )
-            hip_root = os.path.join(version_root, "hip")
-            os.makedirs(hip_root, exist_ok=True)
-            hip_path = os.path.join(hip_root, "source.hip")
+            # Keep the source scene at the package root so it is both obvious
+            # on disk and directly publishable as an AYON representation.
+            hip_path = os.path.join(version_root, "source.hip")
             _save_snapshot(hip_path)
 
-            display_name = "{}-v{:03d}".format(pass_entry.name, version)
+            # source.hip keeps the active farm filter. The artist's live node
+            # should return to pass-through immediately instead of remaining
+            # filtered throughout the rest of the Deadline submission.
+            _reset_dispatcher_filter(node)
+
+            batch_name = "{} | v{:03d}".format(
+                _deadline_batch_name(pass_entry.name), version
+            )
+            job_name_root = batch_name
+            display_name = "{} | Render".format(job_name_root)
             render_wrapper = os.path.join(
                 os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                 "render_farm.py",
@@ -2455,6 +3185,7 @@ def dispatch_to_deadline(
             job_info = {
                 "Plugin": "CommandLine",
                 "Name": display_name,
+                "BatchName": batch_name,
                 "Frames": deadline_frames,
                 "ChunkSize": chunk_size,
                 "Pool": pool.strip(),
@@ -2462,26 +3193,58 @@ def dispatch_to_deadline(
                 "Priority": priority,
                 "EnvironmentKeyValue0": "AYON_CONTEXT_JSON={}".format(context_path),
                 "EnvironmentKeyValue1": "BMFX_RENDER_VERSION={}".format(version),
+                "EnvironmentKeyValue2": "BMFX_PACKAGE_ID={}".format(package_id),
+                "EnvironmentKeyValue3": "BMFX_EXECUTION_ID={}".format(execution_id),
+                "ExtraInfo0": package_id,
                 "MachineLimit": machine_limit or None,
                 "OutputFilename0": pass_output_path or None,
             }
-            _add_pipeline_environment(job_info, start_index=2)
-            render_arguments = " ".join((
+            output_index = 1
+            if deep_output_path:
+                job_info["OutputFilename{}".format(output_index)] = deep_output_path
+                output_index += 1
+            for spec in cryptomatte_specs[1:] if is_cryptomatte_job else ():
+                job_info["OutputFilename{}".format(output_index)] = (
+                    spec["output_path"]
+                )
+                output_index += 1
+            _add_pipeline_environment(job_info, start_index=4)
+            render_arguments = [
                 _quoted_argument(render_python),
                 _quoted_argument(render_wrapper),
                 "--hython", _quoted_argument(hython_executable),
                 "--scene", _quoted_argument(hip_path),
                 "--rop", _quoted_argument(rop.path()),
                 "--context", _quoted_argument(context_path),
-                # Hashes avoid shell expansion of Houdini's $F token. The
-                # farm wrapper converts them back before setting outputimage.
-                "--output", _quoted_argument(
-                    _denoise_input_template(pass_output_path)
-                ),
                 "--start", "<STARTFRAME>",
                 "--end", "<ENDFRAME>",
                 "--step", str(frame_step),
+            ]
+            if render_driver_output_path:
+                # Hashes avoid shell expansion of Houdini's $F token. The
+                # farm wrapper converts them back before setting outputimage.
+                render_arguments.extend((
+                    "--output",
+                    _quoted_argument(
+                        _denoise_input_template(render_driver_output_path)
+                    ),
+                ))
+            render_arguments.extend((
+                "--metrics", _quoted_argument(metrics_path),
             ))
+            if deep_output_path:
+                render_arguments.extend((
+                    "--deep-output",
+                    _quoted_argument(
+                        _denoise_input_template(deep_output_path)
+                    ),
+                ))
+            if cryptomatte_map_path:
+                render_arguments.extend((
+                    "--cryptomatte-map",
+                    _quoted_argument(cryptomatte_map_path),
+                ))
+            render_arguments = " ".join(render_arguments)
             plugin_info = {
                 "Executable": render_python,
                 "Arguments": render_arguments,
@@ -2509,6 +3272,39 @@ def dispatch_to_deadline(
             finally:
                 _remove_submission_info_files(job_path, plugin_path)
             submitted.append((pass_entry.path, job_id))
+            deep_data = {
+                "enabled": bool(deep_output_path),
+                "reason": "" if deep_output_path else (
+                    "Disabled by user"
+                    if not enable_deep
+                    else "Deep holdouts are generated for Beauty passes only"
+                ),
+                "job_id": job_id if deep_output_path else "",
+                "job_name": display_name if deep_output_path else "",
+                "output_path": deep_output_path,
+                "product_type": "deepexr" if deep_output_path else "",
+                "driver": "deepexr" if deep_output_path else "",
+                "channels": (
+                    ["Ci", "alpha", "deep.front", "deep.back"]
+                    if deep_output_path else []
+                ),
+                "denoised": False,
+                "mode": "same_render" if deep_output_path else "disabled",
+            }
+            cryptomatte_data = {
+                "enabled": bool(cryptomatte_specs),
+                "reason": (
+                    "" if cryptomatte_specs
+                    else "No BMFX Cryptomatte Creator prim was detected"
+                ),
+                "job_id": job_id if cryptomatte_specs else "",
+                "job_name": display_name if cryptomatte_specs else "",
+                "mode": (
+                    "independent_render" if cryptomatte_specs else "disabled"
+                ),
+                "mapping_path": cryptomatte_map_path,
+                "outputs": cryptomatte_specs,
+            }
             denoise_data = {
                 "enabled": False,
                 "reason": (
@@ -2532,7 +3328,8 @@ def dispatch_to_deadline(
                     deadline_command=deadline_command,
                     version_root=version_root,
                     render_job_id=job_id,
-                    render_job_name=display_name,
+                    render_job_name=job_name_root,
+                    batch_name=batch_name,
                     input_path=pass_output_path,
                     frame_start=frame_start,
                     frame_end=frame_end,
@@ -2544,7 +3341,9 @@ def dispatch_to_deadline(
             manifest_path = _write_submission_manifest(
                 version_root,
                 {
-                    "schema_version": 4,
+                    "schema_version": 8,
+                    "package_id": package_id,
+                    "execution_id": execution_id,
                     "artist": os.getenv("AYON_USERNAME") or getpass.getuser(),
                     "submitted_at_utc": datetime.now(timezone.utc).isoformat(),
                     "submission_host": socket.gethostname(),
@@ -2553,6 +3352,7 @@ def dispatch_to_deadline(
                     "software_versions": _manifest_software_versions(),
                     "source_working_hip": original_working_hip,
                     "source_farm_hip": hip_path,
+                    "scene_dependencies": scene_dependencies,
                     # Keep the original flat fields for older readers and add
                     # structured metadata alongside them.
                     "aovs": pass_aovs,
@@ -2578,21 +3378,30 @@ def dispatch_to_deadline(
                     },
                     "deadline_job_id": job_id,
                     "denoise": denoise_data,
+                    "deep_holdout": deep_data,
+                    "cryptomatte": cryptomatte_data,
                     "frame_range": [frame_start, frame_end, frame_step],
                     "hip_file": hip_path,
                     "output_path": pass_output_path,
+                    "rop_output_path": render_driver_output_path,
                     "pass_name": pass_entry.name,
                     "pass_path": pass_entry.path,
                     "render_department": _pass_department(
                         pass_entry.name, pass_entry.department
                     ),
                     "render_settings": pass_entry.render_settings,
+                    "render_metadata": _render_report_metadata(
+                        node, pass_entry.render_settings
+                    ),
                     "renderer": "RenderMan RIS",
                     "render_preset": pass_preset,
+                    "render_kind": pass_entry.kind,
                     "version": version,
                 },
             )
             submission_records.append({
+                "package_id": package_id,
+                "execution_id": execution_id,
                 "pass_entry": pass_entry,
                 "pass_index": pass_index,
                 "preset": pass_preset,
@@ -2608,13 +3417,22 @@ def dispatch_to_deadline(
                 "version_root": version_root,
                 "input_path": pass_output_path,
                 "source_hip": hip_path,
-                "render_job_name": display_name,
+                "render_job_name": job_name_root,
+                "render_job_display_name": display_name,
+                "batch_name": batch_name,
                 "render_job_id": job_id,
                 "terminal_job_id": (
                     denoise_data.get("denoise_job_id") or job_id
                 ),
                 "denoise_enabled": bool(denoise_data.get("enabled")),
+                "deep_holdout": deep_data,
+                "cryptomatte": cryptomatte_data,
+                "cryptomatte_only": is_cryptomatte_job,
+                "telemetry_glob": os.path.join(
+                    metrics_root, "frame_*.json"
+                ).replace("\\", "/"),
                 "manifest_path": manifest_path,
+                "scene_dependencies": scene_dependencies,
             })
             _notify_dispatch_progress(
                 progress_callback, pass_entry, pass_index, total_passes,
@@ -2629,12 +3447,9 @@ def dispatch_to_deadline(
             )
             _LOGGER.info("Submitted %s as Deadline job %s", pass_entry.path, job_id)
 
-        # A review job for each Beauty pass waits for the terminal job of every
-        # selected pass. This guarantees movies cannot begin while another
-        # render or denoise job in this dispatch is still running.
-        terminal_job_ids = [
-            record["terminal_job_id"] for record in submission_records
-        ]
+        # Keep every pass chain independent. Review media waits only for its
+        # own render/denoise terminal job, and AYON Publish then waits for that
+        # pass's review media. A slow or failed sibling pass must not block it.
         for record in submission_records:
             pass_entry = record["pass_entry"]
             review_media = {
@@ -2655,8 +3470,9 @@ def dispatch_to_deadline(
                 review_media = _submit_review_media_job(
                     deadline_command=deadline_command,
                     version_root=record["version_root"],
-                    dependency_job_ids=terminal_job_ids,
+                    dependency_job_ids=[record["terminal_job_id"]],
                     render_job_name=record["render_job_name"],
+                    batch_name=record["batch_name"],
                     input_path=record["input_path"],
                     frame_start=frame_start,
                     frame_end=frame_end,
@@ -2690,6 +3506,7 @@ def dispatch_to_deadline(
                     dependency_job_id=publish_dependency_id,
                     render_job_id=record["render_job_id"],
                     render_job_name=record["render_job_name"],
+                    batch_name=record["batch_name"],
                     product_name=record["product_name"],
                     version=record["version"],
                     source_hip=record["source_hip"],
@@ -2701,10 +3518,21 @@ def dispatch_to_deadline(
                     pass_name=pass_entry.name,
                     preset=record["preset"],
                     department=record["department"],
+                    deep_holdout=record["deep_holdout"],
+                    cryptomatte=record["cryptomatte"],
+                    cryptomatte_only=record["cryptomatte_only"],
                     pool=pool,
                     group=group,
                     priority=priority,
+                    package_id=record["package_id"],
+                    execution_id=record["execution_id"],
+                    scene_dependencies=record["scene_dependencies"],
                 )
+            record["report_terminal_job_id"] = (
+                ayon_publish.get("job_id")
+                if ayon_publish.get("enabled")
+                else publish_dependency_id
+            )
             try:
                 with open(record["manifest_path"], "r") as stream:
                     manifest_payload = json.load(stream)
@@ -2725,16 +3553,73 @@ def dispatch_to_deadline(
                 version=record["version"],
                 job_id=record["render_job_id"],
             )
+
+        # Attach one dashboard/Discord notification to each pass's existing
+        # terminal job. A delayed, suspended, or failed sibling pass must not
+        # prevent completed passes from reporting their own result.
+        if submission_records and discord_notify:
+            try:
+                common_client = os.getenv(
+                    "BMFX_COMMON_CLIENT",
+                    "/jobs/Pipeline/Addons/bmfx-common/client",
+                )
+                if common_client not in sys.path:
+                    sys.path.insert(0, common_client)
+                from bmfx_common import farm_report
+
+                report_context = _manifest_ayon_context()
+                for record in submission_records:
+                    terminal_job_id = record.get("report_terminal_job_id")
+                    if not terminal_job_id:
+                        continue
+                    try:
+                        farm_report.attach_report_to_job(
+                            deadline_command=deadline_command,
+                            host_job_id=terminal_job_id,
+                            dependency_job_ids=[],
+                            report_root=os.path.join(
+                                record["version_root"], "farm_report"
+                            ),
+                            layers=[{
+                                "name": record["pass_entry"].name,
+                                "job_id": record["render_job_id"],
+                                "telemetry_glob": record["telemetry_glob"],
+                                "manifest_path": record["manifest_path"],
+                            }],
+                            project=report_context.get("project_name", ""),
+                            shot=report_context.get("folder_path", ""),
+                            task=report_context.get("task_name", ""),
+                            dcc="Houdini",
+                        )
+                    except Exception:
+                        _LOGGER.exception(
+                            "Could not attach Discord reporting to %s",
+                            record["pass_entry"].name,
+                        )
+            except Exception:
+                # Report configuration must never make successfully submitted
+                # render chains appear to have failed in the dispatcher UI.
+                _LOGGER.exception(
+                    "Could not initialize per-job Discord reporting"
+                )
     finally:
+        try:
+            _restore_cryptomatte_creator_filenames(
+                cryptomatte_creator_bindings
+            )
+        except Exception:
+            _LOGGER.exception(
+                "Could not restore Cryptomatte Creator Filename parameters"
+            )
         for rop in rops:
             try:
                 rop.destroy()
             except Exception:
                 pass
-        for name, value in hidden_parms.items():
-            parm = node.parm(name)
-            if parm is not None:
-                parm.set(value)
+        # Never restore a previous hidden value: an older HIP may already have
+        # saved dispatcher_filter_active=1. Neutral is the only valid state in
+        # the artist's scene.
+        _reset_dispatcher_filter(node, cook=False)
         if render_setting_node is not None and original_render_preset is not None:
             try:
                 _apply_render_setting_preset(
@@ -2747,7 +3632,7 @@ def dispatch_to_deadline(
         try:
             node.cook(force=True)
         except Exception:
-            pass
+            _LOGGER.exception("Could not restore dispatcher pass-through stage")
     return submitted
 
 
@@ -2790,6 +3675,7 @@ class DispatchProgressDialog(QtWidgets.QDialog if QtWidgets is not None else obj
         "Preparing": "#70b9ed",
         "Saving Farm Scene": "#e0b15b",
         "Submitting to Farm": "#ef944d",
+        "Submitting Deep Holdout": "#6ea8fe",
         "Submitting Denoise": "#c58aef",
         "Submitted on Farm": "#55c68c",
         "Render + Denoise Submitted": "#55c68c",
@@ -3104,12 +3990,31 @@ class RenderDispatcherDialog(QtWidgets.QDialog if QtWidgets is not None else obj
         buttons = QtWidgets.QHBoxLayout()
         refresh_button = QtWidgets.QPushButton("Refresh Preflight")
         refresh_button.setObjectName("refreshButton")
+        self.deep_checkbox = QtWidgets.QCheckBox("Submit Deep Holdout")
+        self.deep_checkbox.setChecked(
+            _dispatch_settings_from_node(self.node).enable_deep
+        )
+        self.deep_checkbox.setToolTip(
+            "Submit a parallel RenderMan RIS Deep EXR job for each Beauty pass. "
+            "Deep output is not denoised or used for review media."
+        )
+        self.discord_notify_checkbox = QtWidgets.QCheckBox(
+            "Discord Personal Message"
+        )
+        self.discord_notify_checkbox.setChecked(True)
+        self.discord_notify_checkbox.setToolTip(
+            "After the full farm chain completes, Houdini Bot posts the "
+            "CPU/RAM/GPU graph as a private Discord message. The Worker "
+            "reads BMFX_DISCORD_BOT_TOKEN and BMFX_DISCORD_USER_ID."
+        )
         close_button = QtWidgets.QPushButton("Close")
         close_button.setObjectName("closeButton")
         self.dispatch_button = QtWidgets.QPushButton("Dispatch to Farm")
         self.dispatch_button.setObjectName("primaryButton")
         self.dispatch_button.setMinimumHeight(38)
         buttons.addWidget(refresh_button)
+        buttons.addWidget(self.deep_checkbox)
+        buttons.addWidget(self.discord_notify_checkbox)
         buttons.addStretch(1)
         buttons.addWidget(close_button)
         buttons.addWidget(self.dispatch_button)
@@ -3252,6 +4157,8 @@ class RenderDispatcherDialog(QtWidgets.QDialog if QtWidgets is not None else obj
                 if department.strip().lower() == category.strip().lower()
                 else "{} / {}".format(department, category)
             )
+            if entry.kind == "cryptomatte":
+                category_display = "Utility / Data"
             values = (
                 entry.name,
                 category_display,
@@ -3266,6 +4173,21 @@ class RenderDispatcherDialog(QtWidgets.QDialog if QtWidgets is not None else obj
     def _on_pass_current_changed(self, current, previous):
         path = current.data(QtCore.Qt.UserRole) if current is not None else ""
         self._active_pass_path = path or ""
+        entry = next(
+            (
+                item for item in self.preflight.passes
+                if item.path == self._active_pass_path
+            ),
+            None,
+        )
+        if entry is not None and entry.kind == "cryptomatte":
+            self.aov_context_label.setText(
+                "Cryptomatte output is controlled by the Creator HDA"
+            )
+            self.aov_list.setEnabled(False)
+        else:
+            self.aov_context_label.setText("Select AOVs")
+            self.aov_list.setEnabled(True)
         selected = self.pass_aov_selections.get(self._active_pass_path, set())
         self._loading_aovs = True
         for index in range(self.aov_list.count()):
@@ -3343,7 +4265,16 @@ class RenderDispatcherDialog(QtWidgets.QDialog if QtWidgets is not None else obj
             return
         passes_without_aovs = [
             path for path in selected_passes
-            if not self.pass_aov_selections.get(path)
+            if (
+                not self.pass_aov_selections.get(path)
+                and next(
+                    (
+                        entry.kind for entry in self.preflight.passes
+                        if entry.path == path
+                    ),
+                    "render",
+                ) != "cryptomatte"
+            )
         ]
         if passes_without_aovs:
             names = {
@@ -3392,6 +4323,8 @@ class RenderDispatcherDialog(QtWidgets.QDialog if QtWidgets is not None else obj
                 enable_denoise=settings.enable_denoise,
                 denoise_chunk_size=settings.denoise_chunk_size,
                 publish_on_ayon=settings.publish_on_ayon,
+                enable_deep=self.deep_checkbox.isChecked(),
+                discord_notify=self.discord_notify_checkbox.isChecked(),
                 aovs_by_pass={
                     path: sorted(self.pass_aov_selections.get(path, set()))
                     for path in selected_passes
@@ -3419,6 +4352,9 @@ def show_dispatcher(node_or_kwargs=None):
     node = _resolve_node(node_or_kwargs)
     if node is None:
         raise RuntimeError("Could not resolve the Render Dispatcher node.")
+    # Opening Preflight is also the migration path for HIP files saved by an
+    # older dispatcher while its temporary farm filter was still active.
+    _reset_dispatcher_filter(node)
     parent = hou.qt.mainWindow() if hasattr(hou, "qt") else None
     dialog = RenderDispatcherDialog(node, parent=parent)
     dialog.show()

@@ -2,9 +2,9 @@ import hou
 import logging
 import os
 import re
-from datetime import datetime
 from ayon_core.pipeline import get_current_context
 import json
+import shutil
 import tempfile
 import subprocess
 import shutil
@@ -31,6 +31,36 @@ _FROZEN_WRITE_VERSION = None
 
 _DEADLINE_MACHINE_LIST_PARM = "machine_list"
 _DEADLINE_MACHINE_DENYLIST_PARM = "machine_list_is_deny"
+
+
+def _build_default_batch_name(node, version):
+    context = get_current_context() or {}
+    project = str(context.get("project_name") or "UNKNOWN_PROJECT").upper()
+    folder_path = (context.get("folder_path") or "").strip("/")
+    shot = (os.path.basename(folder_path) or "UNKNOWN_SHOT").upper()
+    department = str(
+        context.get("task_name") or "UNKNOWN_DEPARTMENT"
+    ).upper()
+    return "{}_{}_{}_{}_v{:03d}".format(
+        project,
+        shot,
+        department,
+        node.name(),
+        int(version),
+    )
+
+
+def _build_deadline_job_name(node, version):
+    return "{}_v{:03d}".format(node.name(), int(version))
+
+
+def _deadline_bin_directory():
+    """Return Deadline's bin directory for farm-side child processes."""
+    deadline_path = str(os.environ.get("DEADLINE_PATH") or "").strip()
+    if deadline_path:
+        return deadline_path
+    command = shutil.which("deadlinecommand")
+    return os.path.dirname(command) if command else ""
 
 
 def _normalized_machine_list(raw_value):
@@ -1117,12 +1147,6 @@ def set_status(node, state):
 
     node.setGenericFlag(hou.nodeFlag.DisplayComment, True)
 
-def _build_default_batch_name(node, version):
-    hip_name = os.path.splitext(hou.hipFile.basename())[0] or "untitled"
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    return f"{hip_name} | {node.name()} | v{int(version):03d} | {timestamp}"
-
-
 def _write_deadline_info_file(data, suffix):
     info_file = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
     with open(info_file.name, "wb") as stream:
@@ -1523,8 +1547,7 @@ def _submit_master_wrapper_job(
 
     job_info = {
         "Plugin": "CommandLine",
-        "BatchName": batch_name,
-        "Name": f"{node.name()} | v{version:03d} | master.usdc",
+        "Name": _build_deadline_job_name(node, version) + "_master",
         "Frames": "0",
         "ChunkSize": 1,
         "Pool": "houdini",
@@ -1533,6 +1556,11 @@ def _submit_master_wrapper_job(
         "EnvironmentKeyValue0": f"AYON_CONTEXT_JSON={json_path}",
         "EnvironmentKeyValue1": f"BMFX_FROZEN_VERSION={version}",
     }
+    deadline_bin = _deadline_bin_directory()
+    if deadline_bin:
+        job_info["EnvironmentKeyValue2"] = f"DEADLINE_PATH={deadline_bin}"
+    if batch_name:
+        job_info["BatchName"] = batch_name
 
     if machine_limit:
         job_info["MachineLimit"] = machine_limit
@@ -1585,7 +1613,6 @@ def submit_cache_to_deadline(
     
     chunk_size = (f2 - f1) + 1 if single_machine else user_chunks
 
-    # Use the provided batch_name (from Farmer) or create a default
     if not batch_name:
         batch_name = _build_default_batch_name(node, version)
 
@@ -1613,8 +1640,7 @@ def submit_cache_to_deadline(
     # --- JOB INFO ---
     job_info = {
         "Plugin": "Houdini",
-        "BatchName": batch_name, # Grouping key
-        "Name": f"{node.name()} | v{version:03d}", # Sub-branch name
+        "Name": _build_deadline_job_name(node, version),
         "Frames": f"{f1}-{f2}",
         "ChunkSize": chunk_size,
         "Pool": "houdini",
@@ -1622,9 +1648,15 @@ def submit_cache_to_deadline(
         "EnvironmentKeyValue0": f"AYON_CONTEXT_JSON={json_path}",
         "EnvironmentKeyValue1": f"BMFX_FROZEN_VERSION={version}",
     }
+    deadline_bin = _deadline_bin_directory()
+    if deadline_bin:
+        job_info["EnvironmentKeyValue2"] = f"DEADLINE_PATH={deadline_bin}"
+    job_info["BatchName"] = batch_name
 
     if dependent_job_id:
-        job_info["JobDependency0"] = dependent_job_id
+        dependency_value = str(dependent_job_id)
+        key = "JobDependencies" if "," in dependency_value else "JobDependency0"
+        job_info[key] = dependency_value
     if normalized_machine_limit:
         job_info["MachineLimit"] = normalized_machine_limit
     if normalized_machine_list:

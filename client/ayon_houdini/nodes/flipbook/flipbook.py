@@ -111,7 +111,6 @@ class FlipbookShelfTool(QtWidgets.QDialog):
             | QtCore.Qt.WindowTitleHint
             | QtCore.Qt.WindowSystemMenuHint
             | QtCore.Qt.WindowCloseButtonHint
-            | QtCore.Qt.WindowStaysOnTopHint
             | QtCore.Qt.WindowMinimizeButtonHint
         )
 
@@ -993,6 +992,12 @@ class FlipbookShelfTool(QtWidgets.QDialog):
     # Flipbook
     # --------------------------------------------------
     def do_flipbook(self):
+        # Resolve this immediately before capture. Pane tabs can be replaced
+        # when desktops change, leaving the reference from __init__ stale.
+        scene_viewer = hou.ui.paneTabOfType(hou.paneTabType.SceneViewer)
+        if scene_viewer is not None:
+            self.scene_viewer = scene_viewer
+
         if not self.scene_viewer:
             log.error("Flipbook aborted: no Scene Viewer found.")
             return
@@ -1040,6 +1045,7 @@ class FlipbookShelfTool(QtWidgets.QDialog):
             viewport = self.scene_viewer.curViewport()
             self._apply_selected_camera(viewport)
             self._apply_resolution(settings, viewport=viewport)
+
             self.scene_viewer.flipbook(viewport, settings)
 
             self.last_flipbook = {
@@ -1075,6 +1081,25 @@ class FlipbookShelfTool(QtWidgets.QDialog):
             raise RuntimeError("Run flipbook first.")
 
         context = self._get_ayon_context()
+        try:
+            from ayon_houdini.nodes.scene_dependencies import (
+                collect_scene_dependencies,
+            )
+        except ImportError:
+            from nodes.scene_dependencies import collect_scene_dependencies
+        stage = None
+        try:
+            current_node = self.scene_viewer.pwd()
+            stage_method = getattr(current_node, "stage", None)
+            if callable(stage_method):
+                stage = stage_method()
+        except Exception:
+            stage = None
+        scene_dependencies = collect_scene_dependencies(
+            project_name=context.get("project_name") or "",
+            stage=stage,
+            hou_module=hou,
+        )
         payload = {
             "product_name": self.last_flipbook["product_name"],
             "path_or_paths": self.last_flipbook["pattern"],
@@ -1086,6 +1111,11 @@ class FlipbookShelfTool(QtWidgets.QDialog):
             "task_name": context.get("task_name"),
             "author": context.get("author"),
             "version": int(self.last_flipbook["local_version"]),
+            "source_path": self.last_flipbook.get("hip_snapshot"),
+            # Serialized into the Deadline payload as well, so a farm publish
+            # links the scene that generated the flipbook—not the farm
+            # process's otherwise empty runtime context.
+            "scene_dependencies": scene_dependencies,
         }
         payload.update(self._build_publish_options())
         return payload
@@ -1444,22 +1474,22 @@ if __name__ == "__main__":
 # --------------------------------------------------
 # Launch Safely
 # --------------------------------------------------
-def _close_existing_tool():
-    if not hasattr(hou.session, "ayon_fb_tool"):
-        return
-    try:
-        hou.session.ayon_fb_tool.close()
-        hou.session.ayon_fb_tool.deleteLater()
-    except Exception:
-        pass
-
-
 def launch():
     if hou.hipFile.path() == "untitled.hip":
         log.warning("Please save scene before running.")
         return
 
-    _close_existing_tool()
+    existing_tool = getattr(hou.session, "ayon_fb_tool", None)
+    if existing_tool is not None:
+        try:
+            existing_tool.show()
+            existing_tool.raise_()
+            existing_tool.activateWindow()
+            return
+        except RuntimeError:
+            # The Python wrapper survived after Qt deleted the C++ dialog.
+            hou.session.ayon_fb_tool = None
+
     hou.session.ayon_fb_tool = FlipbookShelfTool(parent=hou.qt.mainWindow())
     hou.session.ayon_fb_tool.show()
 

@@ -2,7 +2,7 @@
 LOPs material builder for Solaris.
 
 Features:
-- Creates a Material Library LOP in /stage.
+- Creates materials in a supplied Material Library LOP, or one in /stage.
 - Creates MaterialX or PXR shader networks from texture files.
 - Supports UDIM token conversion (<UDIM>) via UI toggle.
 """
@@ -644,11 +644,13 @@ class MaterialBuilder:
     MATERIALX = "materialx"
     PXR = "pxr"
 
-    def __init__(self, material_name, use_udim=False, builder_type=MATERIALX, use_aces=False):
+    def __init__(self, material_name, use_udim=False, builder_type=MATERIALX,
+                 use_aces=False, material_library=None):
         self.material_name = self._sanitize_name(material_name)
         self.use_udim = bool(use_udim)
         self.use_aces = bool(use_aces)
         self.builder_type = self._normalize_builder_type(builder_type)
+        self.material_library = material_library
         self.textures = {}
 
     @classmethod
@@ -687,11 +689,14 @@ class MaterialBuilder:
         if not self.textures:
             raise RuntimeError("No recognized textures were provided.")
 
-        stage = hou.node("/stage")
-        if stage is None:
-            raise RuntimeError("Could not find /stage network.")
-
-        matlib, created_new_matlib = self._find_or_create_materiallibrary(stage)
+        if self.material_library is not None:
+            matlib = self.material_library
+            created_new_matlib = False
+        else:
+            stage = hou.node("/stage")
+            if stage is None:
+                raise RuntimeError("Could not find /stage network.")
+            matlib, created_new_matlib = self._find_or_create_materiallibrary(stage)
         if created_new_matlib:
             matpath_prefix = matlib.parm("matpathprefix")
             if matpath_prefix:
@@ -2025,7 +2030,7 @@ class MaterialBuilder:
         self._connect_manifold_to_all_textures(parent, manifold)
 
 
-def show_ui(parent=None):
+def show_ui(parent=None, material_library=None):
     from qtpy import QtCore, QtWidgets
 
     class DropPathListWidget(QtWidgets.QListWidget):
@@ -2073,6 +2078,7 @@ def show_ui(parent=None):
     class MaterialXBuilderDialog(QtWidgets.QDialog):
         def __init__(self, ui_parent=None):
             super().__init__(ui_parent)
+            self.material_library = material_library
             self.setWindowTitle("BMFX material builder")
             self.setWindowFlags(
                 QtCore.Qt.Window
@@ -2902,6 +2908,7 @@ def show_ui(parent=None):
                             use_udim=self.udim_check.isChecked(),
                             builder_type=builder_type,
                             use_aces=self.aces_check.isChecked(),
+                            material_library=self.material_library,
                         )
                         for channel_name, texture_path in group["textures"].items():
                             builder.add_texture(
@@ -2983,6 +2990,7 @@ def show_ui(parent=None):
                     use_udim=self.udim_check.isChecked(),
                     builder_type=builder_type,
                     use_aces=self.aces_check.isChecked(),
+                    material_library=self.material_library,
                 )
                 for channel_name, texture_path in textures.items():
                     builder.add_texture(
@@ -3023,6 +3031,7 @@ def show_ui(parent=None):
     if existing_dialog is not None:
         try:
             if existing_dialog.isVisible():
+                existing_dialog.material_library = material_library
                 existing_dialog.raise_()
                 existing_dialog.activateWindow()
                 return existing_dialog

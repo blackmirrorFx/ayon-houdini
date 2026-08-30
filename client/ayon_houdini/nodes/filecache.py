@@ -2,9 +2,9 @@ import hou
 import logging
 import os
 import re
-from datetime import datetime
 from ayon_core.pipeline import get_current_context
 import json
+import shutil
 import tempfile
 import subprocess
 
@@ -29,6 +29,36 @@ _FROZEN_WRITE_VERSION = None
 
 _DEADLINE_MACHINE_LIST_PARM = "machine_list"
 _DEADLINE_MACHINE_DENYLIST_PARM = "machine_list_is_deny"
+
+
+def _build_default_batch_name(node, version):
+    context = get_current_context() or {}
+    project = str(context.get("project_name") or "UNKNOWN_PROJECT").upper()
+    folder_path = (context.get("folder_path") or "").strip("/")
+    shot = (os.path.basename(folder_path) or "UNKNOWN_SHOT").upper()
+    department = str(
+        context.get("task_name") or "UNKNOWN_DEPARTMENT"
+    ).upper()
+    return "{}_{}_{}_{}_v{:03d}".format(
+        project,
+        shot,
+        department,
+        node.name(),
+        int(version),
+    )
+
+
+def _build_deadline_job_name(node, version):
+    return "{}_v{:03d}".format(node.name(), int(version))
+
+
+def _deadline_bin_directory():
+    """Return Deadline's bin directory for the farm-side Houdini process."""
+    deadline_path = str(os.environ.get("DEADLINE_PATH") or "").strip()
+    if deadline_path:
+        return deadline_path
+    command = shutil.which("deadlinecommand")
+    return os.path.dirname(command) if command else ""
 
 
 def _normalized_machine_list(raw_value):
@@ -259,7 +289,9 @@ def get_pipeline_env():
 
     return env
 
-def save_ayon_context_for_node(node, version):
+def save_ayon_context_for_node(
+    node, version, scene_dependencies=None, dependency_manifest_path=None
+):
     path = ayon_context_json_path(node, version)
     data = {
         "launcher_env": get_ayon_launcher_env(),
@@ -267,6 +299,8 @@ def save_ayon_context_for_node(node, version):
             get_all_houdini_vars()
         ),
         "pipeline_env": get_pipeline_env(),
+        "bmfx_scene_dependencies": scene_dependencies or {},
+        "bmfx_dependency_manifest": dependency_manifest_path or "",
     }
     with open(path, "w") as f:
         json.dump(data, f, indent=4)
@@ -593,11 +627,6 @@ def set_status(node, state):
 
     node.setGenericFlag(hou.nodeFlag.DisplayComment, True)
 
-def _build_default_batch_name(node, version):
-    hip_name = os.path.splitext(hou.hipFile.basename())[0] or "untitled"
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    return f"{hip_name} | {node.name()} | v{int(version):03d} | {timestamp}"
-
 def submit_cache_to_deadline(
     node,
     dependent_job_id=None,
@@ -605,6 +634,8 @@ def submit_cache_to_deadline(
     machine_limit=None,
     machine_list=None,
     machine_list_is_deny=None,
+    scene_dependencies=None,
+    dependency_manifest_path=None,
 ):
     """
     Submit this FileCache node to Deadline.
@@ -612,7 +643,18 @@ def submit_cache_to_deadline(
     """
     version = active_version(node)
     ensure_deadline_machine_list_parms(node)
-    save_ayon_context_for_node(node, version)
+    version_path = version_dir(node, version, create=True)
+    if scene_dependencies:
+        local_manifest = os.path.join(version_path, "scene_dependencies.json")
+        with open(local_manifest, "w") as stream:
+            json.dump(scene_dependencies, stream, indent=2, sort_keys=True)
+        dependency_manifest_path = local_manifest
+    save_ayon_context_for_node(
+        node,
+        version,
+        scene_dependencies=scene_dependencies,
+        dependency_manifest_path=dependency_manifest_path,
+    )
     json_path = ayon_context_json_path(node, version)
     hip_path = save_hip_to_version_dir(node, version)
 
@@ -625,7 +667,6 @@ def submit_cache_to_deadline(
     
     chunk_size = (f2 - f1) + 1 if single_machine else user_chunks
 
-    # Use the provided batch_name (from Farmer) or create a default
     if not batch_name:
         batch_name = _build_default_batch_name(node, version)
 
@@ -653,8 +694,7 @@ def submit_cache_to_deadline(
     # --- JOB INFO ---
     job_info = {
         "Plugin": "Houdini",
-        "BatchName": batch_name, # Grouping key
-        "Name": f"{node.name()} | v{version:03d}", # Sub-branch name
+        "Name": _build_deadline_job_name(node, version),
         "Frames": f"{f1}-{f2}",
         "ChunkSize": chunk_size,
         "Pool": "houdini",
@@ -662,9 +702,23 @@ def submit_cache_to_deadline(
         "EnvironmentKeyValue0": f"AYON_CONTEXT_JSON={json_path}",
         "EnvironmentKeyValue1": f"BMFX_FROZEN_VERSION={version}",
     }
+    environment_index = 2
+    deadline_bin = _deadline_bin_directory()
+    if deadline_bin:
+        job_info[f"EnvironmentKeyValue{environment_index}"] = (
+            f"DEADLINE_PATH={deadline_bin}"
+        )
+        environment_index += 1
+    job_info["BatchName"] = batch_name
+    if dependency_manifest_path:
+        job_info[f"EnvironmentKeyValue{environment_index}"] = (
+            f"BMFX_SCENE_DEPENDENCIES_JSON={dependency_manifest_path}"
+        )
 
     if dependent_job_id:
-        job_info["JobDependency0"] = dependent_job_id
+        dependency_value = str(dependent_job_id)
+        key = "JobDependencies" if "," in dependency_value else "JobDependency0"
+        job_info[key] = dependency_value
     if normalized_machine_limit:
         job_info["MachineLimit"] = normalized_machine_limit
     if normalized_machine_list:

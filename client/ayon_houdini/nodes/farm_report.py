@@ -18,12 +18,21 @@ import re
 import shutil
 import socket
 import subprocess
+import sys
 import threading
 import time
 import urllib.error
 import urllib.request
 import uuid
 from datetime import datetime, timezone
+
+
+# Deadline's post-job loader does not consistently add the script directory
+# to sys.path. Keep this legacy callback self-contained for already-submitted
+# jobs that still reference the Houdini addon path.
+_MODULE_DIR = os.path.dirname(os.path.abspath(__file__))
+if _MODULE_DIR not in sys.path:
+    sys.path.insert(0, _MODULE_DIR)
 
 
 _TIME_RE = re.compile(
