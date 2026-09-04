@@ -24,8 +24,25 @@ import subprocess
 import sys
 import tempfile
 import uuid
-from datetime import datetime, timezone
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
+
+try:
+    from ayon_houdini.api.file_permissions import read_only_source
+except ImportError:  # Direct source-tree tests and embedded HDA loading.
+    import importlib.util
+
+    _permissions_path = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
+        "api",
+        "file_permissions.py",
+    )
+    _permissions_spec = importlib.util.spec_from_file_location(
+        "ayon_houdini_file_permissions", _permissions_path
+    )
+    _permissions_module = importlib.util.module_from_spec(_permissions_spec)
+    _permissions_spec.loader.exec_module(_permissions_module)
+    read_only_source = _permissions_module.read_only_source
 
 try:
     import hou
@@ -1897,7 +1914,8 @@ def _add_pipeline_environment(job_info, start_index=1):
 
 def _save_snapshot(path):
     normalized = path.replace("\\", "/").replace('"', '\\"')
-    hou.hscript('mwrite -n "{}"'.format(normalized))
+    with read_only_source(path):
+        hou.hscript('mwrite -n "{}"'.format(normalized))
 
 
 def _write_info_file(root, stem, values):
@@ -2011,6 +2029,21 @@ def _renderman_denoise_executable():
     return ""
 
 
+def _review_video_color_metadata(display, view=""):
+    """Return video tags matching the selected OCIO display transform."""
+    transform_name = "{} {}".format(display or "", view or "").lower()
+    transfer = (
+        "iec61966-2-1"
+        if "srgb" in transform_name
+        else "bt709"
+    )
+    return {
+        "output_primaries": "bt709",
+        "output_transfer": transfer,
+        "output_matrix": "bt709",
+    }
+
+
 def _review_media_settings():
     """Resolve the exact OCIO transform and encoder tools used on the farm."""
     from ayon_core.lib import get_ffmpeg_tool_args
@@ -2025,18 +2058,10 @@ def _review_media_settings():
     configured_display = preferences.get("display") or ""
     view = preferences.get("view") or ""
     input_colorspace = get_scene_linear_colorspace() or ""
-    try:
-        active_displays = list(hou.Color.ocio_activeDisplays())
-    except Exception:
-        active_displays = [configured_display] if configured_display else []
-    display = next(
-        (
-            candidate
-            for candidate in active_displays
-            if "rec.709" in candidate.lower() or "rec709" in candidate.lower()
-        ),
-        "",
-    )
+    # Use the same display/view as Houdini's EXR viewer.  Forcing a Rec.709
+    # display here while the session uses sRGB bakes a different transfer into
+    # MOV/MP4 review media, so the movies no longer match their source EXRs.
+    display = configured_display
     if display:
         try:
             display_views = list(hou.Color.ocio_views(display))
@@ -2075,9 +2100,9 @@ def _review_media_settings():
         raise RuntimeError("Houdini Python does not exist: {}".format(review_python))
     if not display:
         raise RuntimeError(
-            "The OCIO config has no active Rec.709 display for review movies."
+            "The OCIO config has no default display for review movies."
         )
-    return {
+    settings = {
         "ffmpeg": ffmpeg_args[0],
         "python": review_python,
         "library_path": review_library_path,
@@ -2085,11 +2110,10 @@ def _review_media_settings():
         "input_colorspace": input_colorspace,
         "display": display,
         "view": view,
-        "output_primaries": "bt709",
-        "output_transfer": "bt709",
-        "output_matrix": "bt709",
         "fps": float(hou.fps()),
     }
+    settings.update(_review_video_color_metadata(display, view))
+    return settings
 
 
 def _quoted_argument(value):
@@ -2223,6 +2247,7 @@ def _submit_denoise_job(
     ).replace("\\", "/")
     input_template = _denoise_input_template(input_path)
     arguments = " ".join((
+        _quoted_argument(python_executable),
         _quoted_argument(wrapper_path),
         "--executable", _quoted_argument(denoise_executable),
         "--input", _quoted_argument(input_template),
@@ -2251,7 +2276,12 @@ def _submit_denoise_job(
         "Executable": python_executable,
         "Arguments": arguments,
         "StartupDirectory": version_root,
-        "ShellExecute": False,
+        # The repository CommandLine plugin only invokes stdout handlers for
+        # its managed-shell path. The executable is therefore included in the
+        # argument string above because ShellManagedProcess executes the full
+        # command stored in Arguments.
+        "ShellExecute": True,
+        "Shell": "default",
         "SingleFramesOnly": False,
     }
     job_path = _write_info_file(
@@ -2267,6 +2297,7 @@ def _submit_denoise_job(
     finally:
         _remove_submission_info_files(job_path, plugin_path)
     finalize_arguments = " ".join((
+        _quoted_argument(python_executable),
         _quoted_argument(wrapper_path),
         "--finalize",
         "--input", _quoted_argument(input_template),
@@ -2292,7 +2323,8 @@ def _submit_denoise_job(
         "Executable": python_executable,
         "Arguments": finalize_arguments,
         "StartupDirectory": version_root,
-        "ShellExecute": False,
+        "ShellExecute": True,
+        "Shell": "default",
         "SingleFramesOnly": False,
     }
     finalize_job_path = _write_info_file(
@@ -2411,7 +2443,8 @@ def _submit_review_media_job(
         "Executable": env_executable,
         "Arguments": arguments,
         "StartupDirectory": version_root,
-        "ShellExecute": False,
+        "ShellExecute": True,
+        "Shell": "default",
         "SingleFramesOnly": False,
     }
     job_path = _write_info_file(version_root, "deadline_media_job.info", job_info)
@@ -2843,7 +2876,24 @@ def _submit_ayon_publish_job(
     environment = _farm_environment()
     environment["BMFX_PACKAGE_ID"] = package_id
     environment["BMFX_EXECUTION_ID"] = execution_id
+    environment["BMFX_DEADLINE_PUBLISH_PROGRESS"] = "1"
     environment.update(metadata["session"])
+    # The headless AYON publisher already computes a fractional progress value
+    # for every processed Pyblish task, but it does not print that value. Load
+    # our farm-only bridge so Deadline receives those real task percentages.
+    addon_root = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
+    progress_plugin_path = os.path.join(
+        addon_root, "plugins", "farm_publish"
+    )
+    existing_plugin_paths = (
+        environment.get("PYBLISHPLUGINPATH")
+        or os.getenv("PYBLISHPLUGINPATH", "")
+    )
+    environment["PYBLISHPLUGINPATH"] = os.pathsep.join(
+        path
+        for path in (progress_plugin_path, existing_plugin_paths)
+        if path
+    )
     # The Deadline Ayon plugin prefers a job-level API key over its repository
     # configuration. Our farm currently has a stale configured key, while the
     # AYON-launched Houdini session has the valid credential. Keep the secret

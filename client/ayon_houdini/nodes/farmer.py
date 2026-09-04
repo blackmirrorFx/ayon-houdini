@@ -1,13 +1,32 @@
 import logging
+import inspect
 import json
 import os
 import re
+import shutil
 import subprocess
 import tempfile
 from datetime import datetime
 
 import hou
 from ayon_core.pipeline import get_current_context
+
+try:
+    from ayon_houdini.api.file_permissions import read_only_source
+except ImportError:  # Direct source-tree tests and embedded HDA loading.
+    import importlib.util
+
+    _permissions_path = os.path.join(
+        os.path.dirname(os.path.dirname(__file__)),
+        "api",
+        "file_permissions.py",
+    )
+    _permissions_spec = importlib.util.spec_from_file_location(
+        "ayon_houdini_file_permissions", _permissions_path
+    )
+    _permissions_module = importlib.util.module_from_spec(_permissions_spec)
+    _permissions_spec.loader.exec_module(_permissions_module)
+    read_only_source = _permissions_module.read_only_source
 
 
 _LOGGER = logging.getLogger("BMFX.Farmer")
@@ -24,16 +43,42 @@ _LOGGER.setLevel(logging.INFO)
 
 _DEADLINE_MACHINE_LIST_PARM = "machine_list"
 _DEADLINE_MACHINE_DENYLIST_PARM = "machine_list_is_deny"
+_DISCORD_NOTIFY_PARM = "discord_notify"
+_LEGACY_EMAIL_PARMS = ("email_farm_report", "email_report_recipients")
+
+_OUTPUT_PARM_NAMES = (
+    "vm_picture",
+    "picture",
+    "outputimage",
+    "sopoutput",
+    "lopoutput",
+    "filename",
+    "file",
+    "output",
+)
+_CONTROL_DRIVER_TYPES = {
+    "batch",
+    "fetch",
+    "merge",
+    "null",
+    "ropnet",
+    "switch",
+}
+
+
+def _append_parm_template(group, template, after=None):
+    """Append a spare parameter, optionally beside an existing parameter."""
+    try:
+        if after and group.find(after):
+            group.insertAfter(after, template)
+        else:
+            group.append(template)
+    except hou.OperationFailed:
+        group.append(template)
 
 
 def ensure_deadline_machine_list_parms(node):
-    """Add Deadline machine list parameters to farmer node in Farm Settings section."""
-    if (
-        node.parm(_DEADLINE_MACHINE_LIST_PARM)
-        and node.parm(_DEADLINE_MACHINE_DENYLIST_PARM)
-    ):
-        _LOGGER.info("Machine list parameters already exist on %s", node.path())
-        return
+    """Add universal Deadline controls missing from older Farmer HDAs."""
 
     try:
         group = node.parmTemplateGroup()
@@ -42,6 +87,19 @@ def ensure_deadline_machine_list_parms(node):
         return
 
     changed = False
+
+    # Migrate existing Farmer nodes away from the retired email controls. The
+    # Discord bot token and user ID are never stored in the HDA or HIP file.
+    for legacy_name in _LEGACY_EMAIL_PARMS:
+        if group.find(legacy_name):
+            try:
+                group.remove(legacy_name)
+                changed = True
+            except hou.OperationFailed:
+                _LOGGER.warning(
+                    "Could not remove legacy Farmer parameter %s",
+                    legacy_name,
+                )
 
     if not group.find(_DEADLINE_MACHINE_DENYLIST_PARM):
         deny_template = hou.ToggleParmTemplate(
@@ -59,6 +117,35 @@ def ensure_deadline_machine_list_parms(node):
         except hou.OperationFailed as e:
             _LOGGER.error("Failed to insert deny list: %s", str(e))
             group.append(deny_template)
+        changed = True
+
+    universal_templates = (
+        (
+            "priority",
+            hou.IntParmTemplate(
+                "priority", "Priority", 1, default_value=(50,), min=0, max=100
+            ),
+            _DEADLINE_MACHINE_LIST_PARM,
+        ),
+        (
+            "pool",
+            hou.StringParmTemplate("pool", "Pool", 1, default_value=("houdini",)),
+            "priority",
+        ),
+        (
+            _DISCORD_NOTIFY_PARM,
+            hou.ToggleParmTemplate(
+                _DISCORD_NOTIFY_PARM,
+                "Discord Personal Message",
+                default_value=True,
+            ),
+            "pool",
+        ),
+    )
+    for parm_name, template, after in universal_templates:
+        if group.find(parm_name):
+            continue
+        _append_parm_template(group, template, after=after)
         changed = True
 
     if not group.find(_DEADLINE_MACHINE_LIST_PARM):
@@ -200,28 +287,31 @@ def _get_hda_module(node):
 
 
 def _is_generic_rop_or_cache(node):
-    """Check if node is a generic ROP or cache node (not an HDA with submit hook)."""
+    """Return whether Deadline's Houdini plugin can render this node directly."""
     if _has_submit_hook(node):
         return False
-    
+
     try:
-        node_type = node.type().name()
-        # Check if it's a ROP node (rop manager type contains 'rop')
+        base_type = node.type().name().split("::", 1)[0].lower()
+        if base_type in _CONTROL_DRIVER_TYPES or "farmer" in base_type:
+            return False
         category = node.type().category().name()
-        if category == "ROP":
-            return True
-        # Check for common cache/render node patterns
-        if any(x in node_type.lower() for x in ["rop", "cache", "render", "bgeo", "usd"]):
-            return True
+        # Houdini calls this category "Driver"; some test doubles and older
+        # APIs expose it as "ROP".
+        return category in {"Driver", "ROP"}
     except Exception:
-        pass
-    
-    return False
+        return False
 
 
 def _has_submit_hook(node):
     module = _get_hda_module(node)
-    return bool(module and hasattr(module, "submit_cache_to_deadline"))
+    return bool(
+        module
+        and (
+            hasattr(module, "submit_wedges_to_deadline")
+            or hasattr(module, "submit_cache_to_deadline")
+        )
+    )
 
 
 def _get_fetch_source(node):
@@ -235,8 +325,12 @@ def _get_fetch_source(node):
     source_path = source_parm.evalAsString().strip() if source_parm else ""
     if not source_path:
         return None
-
-    return hou.node(source_path)
+    if source_path.startswith("op:"):
+        source_path = source_path[3:]
+    try:
+        return node.node(source_path) or hou.node(source_path)
+    except AttributeError:
+        return hou.node(source_path)
 
 
 def _is_submittable_node(node):
@@ -244,7 +338,16 @@ def _is_submittable_node(node):
     return _has_submit_hook(node) or _is_generic_rop_or_cache(node)
 
 
-def _collect_upstream_submit_nodes(farmer_node):
+def _upstream_nodes(node):
+    nodes = [item for item in node.inputs() if item]
+    fetch_source = _get_fetch_source(node)
+    if fetch_source and fetch_source not in nodes:
+        nodes.append(fetch_source)
+    return nodes
+
+
+def _collect_upstream_submit_graph(farmer_node):
+    """Return topologically sorted targets and their nearest job parents."""
     collected = []
     visited = set()
 
@@ -257,12 +360,8 @@ def _collect_upstream_submit_nodes(farmer_node):
             return
         visited.add(node_path)
 
-        for upstream in node.inputs():
+        for upstream in _upstream_nodes(node):
             _walk(upstream)
-
-        fetch_source = _get_fetch_source(node)
-        if fetch_source:
-            _walk(fetch_source)
 
         if _is_submittable_node(node):
             collected.append(node)
@@ -270,31 +369,98 @@ def _collect_upstream_submit_nodes(farmer_node):
     for upstream in farmer_node.inputs():
         _walk(upstream)
 
-    deduped = []
-    seen = set()
-    for node in collected:
+    targets_by_path = {node.path(): node for node in collected}
+    nearest_cache = {}
+    resolving = set()
+
+    def _nearest_targets(node):
         path = node.path()
-        if path in seen:
-            continue
-        seen.add(path)
-        deduped.append(node)
+        if path in nearest_cache:
+            return nearest_cache[path]
+        if path in resolving:
+            _LOGGER.warning("Cycle detected while inspecting Farmer inputs at %s", path)
+            return []
+        resolving.add(path)
+        found = []
+        for upstream in _upstream_nodes(node):
+            upstream_path = upstream.path()
+            if upstream_path in targets_by_path:
+                found.append(upstream_path)
+            else:
+                found.extend(_nearest_targets(upstream))
+        nearest_cache[path] = list(dict.fromkeys(found))
+        resolving.discard(path)
+        return nearest_cache[path]
 
-    return deduped
+    dependencies = {
+        node.path(): [
+            path for path in _nearest_targets(node) if path != node.path()
+        ]
+        for node in collected
+    }
+    return collected, dependencies
 
 
-def _submit_cache_job(module, node, batch_name):
-    # Keep jobs independent (parallel) by not setting dependency ids.
+def _collect_upstream_submit_nodes(farmer_node):
+    """Backward-compatible node-only collector."""
+    return _collect_upstream_submit_graph(farmer_node)[0]
+
+
+def _job_id_list(result):
+    if not result:
+        return []
+    if isinstance(result, (list, tuple, set)):
+        return [str(item) for item in result if item]
+    return [str(result)]
+
+
+def _submit_cache_job(
+    module,
+    node,
+    batch_name,
+    dependency_ids,
+    options,
+    scene_dependencies=None,
+    dependency_manifest_path=None,
+):
+    """Call a specialized cache/wedge hook, retaining legacy compatibility."""
+    dependency_ids = _job_id_list(dependency_ids)
+    submitter = getattr(module, "submit_wedges_to_deadline", None)
+    if submitter is None:
+        submitter = module.submit_cache_to_deadline
+
+    kwargs = {
+        "batch_name": batch_name,
+        "machine_limit": options["machine_limit"],
+        "machine_list": options["machine_list"],
+        "machine_list_is_deny": options["machine_list_is_deny"],
+        "scene_dependencies": scene_dependencies,
+        "dependency_manifest_path": dependency_manifest_path,
+    }
+    if dependency_ids:
+        # In-repository hooks accept a comma-separated dependency value via
+        # JobDependencies. Legacy hooks still receive their usual first ID.
+        kwargs["dependent_job_id"] = ",".join(dependency_ids)
     try:
-        return module.submit_cache_to_deadline(
-            node,
-            dependent_job_id=None,
-            batch_name=batch_name,
-        )
-    except TypeError:
-        try:
-            return module.submit_cache_to_deadline(node, batch_name=batch_name)
-        except TypeError:
-            return module.submit_cache_to_deadline(node)
+        signature = inspect.signature(submitter)
+    except (TypeError, ValueError):
+        # Python functions exposed through some HDA module proxies do not
+        # publish a signature. The in-repository hooks accept these options.
+        return _job_id_list(submitter(node, **kwargs))
+
+    accepts_kwargs = any(
+        parm.kind == inspect.Parameter.VAR_KEYWORD
+        for parm in signature.parameters.values()
+    )
+    if accepts_kwargs:
+        supported = kwargs
+    else:
+        supported = {
+            key: value
+            for key, value in kwargs.items()
+            if key in signature.parameters
+        }
+    return _job_id_list(submitter(node, **supported))
 
 
 def _get_ayon_launcher_env():
@@ -346,6 +512,11 @@ def _get_pipeline_env():
         "PYTHONPATH",
         "HOUDINI_PATH",
         "HOUDINI_OTLSCAN_PATH",
+        # Carry Discord notification configuration with the private AYON
+        # context so Deadline jobs receive it automatically.
+        "BMFX_DISCORD_USER_ID",
+        "BMFX_DISCORD_BOT_TOKEN",
+        "BMFX_DISCORD_API_BASE",
     )
     env = {}
     for k in keys:
@@ -391,7 +562,8 @@ def _save_hip_file_for_submission(submission_root):
         hip_path = os.path.join(submission_root, "source.hip")
         
         hscript_dst = hip_path.replace("\\", "/").replace('"', '\\"')
-        hou.hscript(f'mwrite -n "{hscript_dst}"')
+        with read_only_source(hip_path):
+            hou.hscript(f'mwrite -n "{hscript_dst}"')
         _LOGGER.info("Saved hip file for submission: %s", hip_path)
         return hip_path
     except (hou.OperationFailed, Exception) as exc:
@@ -399,7 +571,9 @@ def _save_hip_file_for_submission(submission_root):
         return None
 
 
-def _save_ayon_context_to_file(submission_root):
+def _save_ayon_context_to_file(
+    submission_root, scene_dependencies=None, dependency_manifest_path=None
+):
     """Save AYON context to a JSON file in the submission directory."""
     try:
         path = os.path.join(submission_root, ".ayon_vars.json")
@@ -409,6 +583,8 @@ def _save_ayon_context_to_file(submission_root):
                 _get_all_houdini_vars()
             ),
             "pipeline_env": _get_pipeline_env(),
+            "bmfx_scene_dependencies": scene_dependencies or {},
+            "bmfx_dependency_manifest": dependency_manifest_path or "",
         }
         with open(path, "w") as f:
             json.dump(data, f, indent=4)
@@ -419,189 +595,292 @@ def _save_ayon_context_to_file(submission_root):
         return None
 
 
-def _get_frame_range(rop_node, farmer_node):
-    """Extract frame range based on farmer node's validfr mode.
-    
-    validfr modes:
-    - 0: Use upstream node's frame range
-    - 1: Use farmer's fx/fy/fz parameters
-    - 2: Use custom frame list
-    """
+def _save_dependency_manifest(submission_root, farmer_node, context):
+    """Freeze live scene provenance before any farm snapshot is submitted."""
     try:
-        validfr_parm = farmer_node.parm("validfr")
-        if not validfr_parm:
-            # Fallback to ROP node's frame range
-            for param_name in ["f1", "frame_start", "start_frame"]:
-                parm = rop_node.parm(param_name)
-                if parm:
-                    f1 = int(parm.eval())
-                    break
-            else:
-                f1 = int(hou.frame())
-            
-            for param_name in ["f2", "frame_end", "end_frame"]:
-                parm = rop_node.parm(param_name)
-                if parm:
-                    f2 = int(parm.eval())
-                    break
-            else:
-                f2 = int(hou.frame())
-            
-            return f1, f2
-        
-        validfr_mode = int(validfr_parm.eval())
-        
-        if validfr_mode == 0:
-            # Use upstream frame range from ROP node
-            for param_name in ["f1", "frame_start", "start_frame"]:
-                parm = rop_node.parm(param_name)
-                if parm:
-                    f1 = int(parm.eval())
-                    break
-            else:
-                f1 = int(hou.frame())
-            
-            for param_name in ["f2", "frame_end", "end_frame"]:
-                parm = rop_node.parm(param_name)
-                if parm:
-                    f2 = int(parm.eval())
-                    break
-            else:
-                f2 = int(hou.frame())
-        
-        elif validfr_mode == 1:
-            # Use farmer's fx/fy parameters
-            fx_parm = farmer_node.parm("fx")
-            fy_parm = farmer_node.parm("fy")
-            f1 = int(fx_parm.eval()) if fx_parm else int(hou.frame())
-            f2 = int(fy_parm.eval()) if fy_parm else int(hou.frame())
-        
-        elif validfr_mode == 2:
-            # Custom frame list - for now treat as range (start to end)
-            fx_parm = farmer_node.parm("fx")
-            fy_parm = farmer_node.parm("fy")
-            f1 = int(fx_parm.eval()) if fx_parm else int(hou.frame())
-            f2 = int(fy_parm.eval()) if fy_parm else int(hou.frame())
-        
+        from ayon_houdini.nodes.scene_dependencies import (
+            collect_scene_dependencies,
+        )
+    except ImportError:
+        from nodes.scene_dependencies import collect_scene_dependencies
+
+    stage = None
+    candidates = [farmer_node] + list(farmer_node.inputs() or [])
+    for candidate in candidates:
+        stage_method = getattr(candidate, "stage", None)
+        if not callable(stage_method):
+            continue
+        try:
+            stage = stage_method()
+        except Exception:
+            stage = None
+        if stage is not None:
+            break
+    dependencies = collect_scene_dependencies(
+        project_name=context.get("project_name") or "",
+        stage=stage,
+        hou_module=hou,
+    )
+    path = os.path.join(submission_root, "scene_dependencies.json")
+    with open(path, "w") as stream:
+        json.dump(dependencies, stream, indent=2, sort_keys=True)
+    _LOGGER.info(
+        "FARMER DEPENDENCIES | %d resources | %d AYON versions | %s",
+        len(dependencies.get("records") or []),
+        len(dependencies.get("input_version_ids") or []),
+        path,
+    )
+    return dependencies, path
+
+
+def _parm_value(node, names, default=None, string=False):
+    for name in names:
+        parm = node.parm(name)
+        if parm is None:
+            continue
+        try:
+            return parm.evalAsString() if string else parm.eval()
+        except Exception:
+            continue
+    return default
+
+
+def _node_frame_range(node):
+    mode = str(_parm_value(node, ("trange", "frame_range"), "", True)).lower()
+    if mode in {"off", "single", "current", "0"}:
+        frame = int(hou.frame())
+        return frame, frame, 1
+    start = int(_parm_value(node, ("f1", "fx", "frame_start", "start_frame"), hou.frame()))
+    end = int(_parm_value(node, ("f2", "fy", "frame_end", "end_frame"), start))
+    step = int(_parm_value(node, ("f3", "fz", "frame_step", "step"), 1) or 1)
+    if end < start:
+        start, end = end, start
+    return start, end, max(1, abs(step))
+
+
+def _get_frame_spec(rop_node, farmer_node):
+    """Return Deadline frames and bounds for every Farmer range mode."""
+    mode = int(_parm_value(farmer_node, ("validfr",), 0) or 0)
+    if mode == 2:
+        frames = str(_parm_value(farmer_node, ("frlist",), "", True)).strip()
+        if not frames:
+            raise ValueError("Custom frame list is empty.")
+        frames = re.sub(r"\s+", "", frames)
+        frame_token = r"-?\d+(?:--?\d+(?:[xX]\d+)?)?"
+        if not re.fullmatch(r"{}(?:,{})*".format(frame_token, frame_token), frames):
+            raise ValueError(
+                "Use Deadline syntax such as 1001-1100,1200 or 1001-1100x2."
+            )
+        # A range dash is a separator, while a leading/double dash denotes a
+        # negative frame. Exclude the increment in tokens such as ``x2``.
+        numbers = [
+            int(value)
+            for value in re.findall(r"(?<![\dxX])-?\d+", frames)
+        ]
+        if not numbers:
+            raise ValueError("Custom frame list contains no frame numbers.")
+        return frames, min(numbers), max(numbers), 1
+    if mode == 1:
+        frame_tuple = farmer_node.parmTuple("f")
+        if frame_tuple and len(frame_tuple) >= 3:
+            values = frame_tuple.eval()
+            start, end, step = int(values[0]), int(values[1]), int(values[2] or 1)
         else:
-            # Fallback
-            f1 = int(hou.frame())
-            f2 = int(hou.frame())
-        
-        return f1, f2
-    except (TypeError, ValueError, AttributeError):
-        current_frame = int(hou.frame())
-        return current_frame, current_frame
+            start = int(_parm_value(farmer_node, ("fx",), hou.frame()))
+            end = int(_parm_value(farmer_node, ("fy",), start))
+            step = int(_parm_value(farmer_node, ("fz",), 1) or 1)
+        if end < start:
+            start, end = end, start
+        step = max(1, abs(step))
+    else:
+        start, end, step = _node_frame_range(rop_node)
+    frames = "{}-{}".format(start, end)
+    if step > 1:
+        frames += "x{}".format(step)
+    return frames, start, end, step
 
 
-def _submit_generic_rop_to_deadline(node, batch_name, farmer_node_name, farmer_node):
+def _get_frame_range(rop_node, farmer_node):
+    """Backward-compatible frame-bound helper."""
+    _frames, start, end, _step = _get_frame_spec(rop_node, farmer_node)
+    return start, end
+
+
+def _farmer_options(farmer_node):
+    machine_limit = int(_parm_value(farmer_node, ("machine_limit",), 0) or 0)
+    return {
+        "priority": max(0, min(100, int(_parm_value(farmer_node, ("priority",), 50)))),
+        "chunk_size": max(1, int(_parm_value(
+            farmer_node, ("chunksize", "chunk_size"), 10
+        ) or 1)),
+        "single_machine": bool(_parm_value(farmer_node, ("single_machine",), False)),
+        "machine_limit": machine_limit if machine_limit > 0 else None,
+        "machine_list": _normalized_machine_list(_parm_value(
+            farmer_node, (_DEADLINE_MACHINE_LIST_PARM,), "", True
+        )),
+        "machine_list_is_deny": bool(_parm_value(
+            farmer_node, (_DEADLINE_MACHINE_DENYLIST_PARM,), False
+        )),
+        "pool": str(_parm_value(farmer_node, ("pool",), "houdini", True) or "houdini"),
+        "discord_notify": bool(_parm_value(
+            farmer_node, (_DISCORD_NOTIFY_PARM,), True
+        )),
+    }
+
+
+def _node_messages(node, method_name):
+    method = getattr(node, method_name, None)
+    if not method:
+        return []
+    try:
+        return [str(message) for message in (method() or []) if message]
+    except Exception:
+        return []
+
+
+def _preflight(farmer_node, nodes, dependencies):
+    """Collect blocking errors and warnings before any jobs are submitted."""
+    errors = []
+    warnings = []
+    deadline_command = shutil.which("deadlinecommand")
+    if not deadline_command:
+        errors.append("deadlinecommand was not found in PATH.")
+    else:
+        try:
+            repository_root = subprocess.check_output(
+                [deadline_command, "-GetRepositoryRoot"],
+                stderr=subprocess.STDOUT,
+                timeout=15,
+            ).decode(errors="replace").strip()
+            if not repository_root or repository_root.lower().startswith("error"):
+                errors.append("Deadline repository connection failed: {}".format(
+                    repository_root or "empty response"
+                ))
+        except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+            output = getattr(exc, "output", b"") or b""
+            if isinstance(output, bytes):
+                output = output.decode(errors="replace")
+            details = str(output).strip() or str(exc)
+            errors.append("Deadline repository connection failed: {}".format(details))
+    hip_path = hou.hipFile.path()
+    if not hip_path or os.path.basename(hip_path).lower() == "untitled.hip":
+        errors.append("Save the Houdini scene before submitting.")
+    if not nodes:
+        errors.append("No supported cache, wedge, or ROP nodes were found upstream.")
+    try:
+        _farmer_options(farmer_node)
+    except (TypeError, ValueError) as exc:
+        errors.append("Invalid Farmer setting: {}".format(exc))
+
+    for node in nodes:
+        path = node.path()
+        try:
+            if node.isBypassed():
+                errors.append("{} is bypassed.".format(path))
+        except Exception:
+            pass
+        errors.extend("{}: {}".format(path, msg) for msg in _node_messages(node, "errors"))
+        warnings.extend("{}: {}".format(path, msg) for msg in _node_messages(node, "warnings"))
+        try:
+            _get_frame_spec(node, farmer_node)
+        except (TypeError, ValueError) as exc:
+            errors.append("{} has an invalid frame range: {}".format(path, exc))
+        if _is_generic_rop_or_cache(node):
+            output_parm = next(
+                (node.parm(name) for name in _OUTPUT_PARM_NAMES if node.parm(name)),
+                None,
+            )
+            if output_parm:
+                try:
+                    if not output_parm.evalAsString().strip():
+                        errors.append("{} has an empty output path.".format(path))
+                except Exception:
+                    warnings.append("Could not evaluate the output path on {}.".format(path))
+
+    graph_lines = []
+    for node in nodes:
+        parent_paths = dependencies.get(node.path(), [])
+        suffix = " <- {}".format(", ".join(parent_paths)) if parent_paths else ""
+        graph_lines.append("{}{}".format(node.path(), suffix))
+    return errors, warnings, graph_lines
+
+
+def _submit_generic_rop_to_deadline(
+    node,
+    batch_name,
+    farmer_node,
+    hip_path=None,
+    ayon_context_json=None,
+    dependency_ids=None,
+    options=None,
+    dependency_manifest_path=None,
+):
     """Submit a generic ROP or cache node to Deadline with AYON context."""
     try:
-        # Ensure farmer node has machine list parameters available
-        if ensure_deadline_machine_list_parms:
-            try:
-                ensure_deadline_machine_list_parms(farmer_node)
-            except Exception:
-                pass
-        # Get job prefix from farmer node
-        try:
-            job_prefix = farmer_node.parm("jobprefix").evalAsString() if farmer_node.parm("jobprefix") else ""
-        except (TypeError, AttributeError):
-            job_prefix = ""
-        
-        # Create submission root directory
-        submission_root = _get_farmer_submission_root(farmer_node_name, job_prefix)
-        
-        # Save hip file and AYON context in the same directory
-        hip_path = _save_hip_file_for_submission(submission_root)
-        if not hip_path:
+        options = options or _farmer_options(farmer_node)
+        if not hip_path or not ayon_context_json:
+            job_prefix = str(_parm_value(
+                farmer_node, ("jobprefix",), "", True
+            )).strip()
+            submission_root = _get_farmer_submission_root(
+                farmer_node.name(), job_prefix
+            )
+            hip_path = hip_path or _save_hip_file_for_submission(submission_root)
+            ayon_context_json = ayon_context_json or _save_ayon_context_to_file(
+                submission_root
+            )
+        if not hip_path or not ayon_context_json:
             return None
-        
-        ayon_context_json = _save_ayon_context_to_file(submission_root)
-        if not ayon_context_json:
-            return None
-        
-        # Get frame range based on farmer node settings
-        f1, f2 = _get_frame_range(node, farmer_node)
+
+        frames, f1, f2, step = _get_frame_spec(node, farmer_node)
         node_name = node.name()
-        
-        # Get parameters from farmer node
-        try:
-            priority = int(farmer_node.parm("priority").eval()) if farmer_node.parm("priority") else 50
-        except (TypeError, AttributeError):
-            priority = 50
-        
-        try:
-            chunk_size = int(farmer_node.parm("chunk_size").eval()) if farmer_node.parm("chunk_size") else 10
-        except (TypeError, AttributeError):
-            chunk_size = 10
-        
-        try:
-            machine_limit = int(farmer_node.parm("machine_limit").eval()) if farmer_node.parm("machine_limit") else 0
-            machine_limit = machine_limit if machine_limit > 0 else None
-        except (TypeError, AttributeError):
-            machine_limit = None
-        
-        try:
-            single_machine = bool(farmer_node.parm("single_machine").eval()) if farmer_node.parm("single_machine") else False
-        except (TypeError, AttributeError):
-            single_machine = False
-        
-        # Adjust chunk size if single machine
-        if single_machine:
-            chunk_size = (f2 - f1) + 1
-        
-        # Get machine list parameters
-        try:
-            machine_list_parm = farmer_node.parm("machine_list")
-            machine_list = machine_list_parm.evalAsString() if machine_list_parm else ""
-        except (TypeError, AttributeError):
-            machine_list = ""
-        
-        try:
-            machine_list_is_deny_parm = farmer_node.parm("machine_list_is_deny")
-            machine_list_is_deny = bool(machine_list_is_deny_parm.eval()) if machine_list_is_deny_parm else False
-        except (TypeError, AttributeError):
-            machine_list_is_deny = False
-        
-        # Build job name with optional prefix
-        if job_prefix.strip():
-            job_name = f"{job_prefix} | {node_name}"
-        else:
-            job_name = node_name
-        
-        # Job info for Deadline
+        job_prefix = str(_parm_value(farmer_node, ("jobprefix",), "", True)).strip()
+        job_name = "{} | {}".format(job_prefix, node_name) if job_prefix else node_name
+        chunk_size = options["chunk_size"]
+        if options["single_machine"]:
+            chunk_size = max(1, int((f2 - f1) / float(step)) + 1)
+
         job_info = {
             "Plugin": "Houdini",
             "BatchName": batch_name,
             "Name": job_name,
-            "Frames": f"{f1}-{f2}",
+            "Frames": frames,
             "ChunkSize": chunk_size,
-            "Pool": "houdini",
-            "Priority": priority,
+            "Pool": options["pool"],
+            "Priority": options["priority"],
             "EnvironmentKeyValue0": f"AYON_CONTEXT_JSON={ayon_context_json}",
             "EnvironmentKeyValue1": "AYON_CONTEXT_INJECTED=1",
         }
-        
-        if machine_limit:
-            job_info["MachineLimit"] = machine_limit
-        
-        # Add machine list/blacklist if provided
-        if machine_list.strip():
-            key = "Blacklist" if machine_list_is_deny else "Whitelist"
-            job_info[key] = machine_list
-        
-        # Plugin info for Deadline - use the saved hip file
+        if dependency_manifest_path:
+            job_info["EnvironmentKeyValue2"] = (
+                "BMFX_SCENE_DEPENDENCIES_JSON={}".format(
+                    dependency_manifest_path
+                )
+            )
+
+        dependency_ids = _job_id_list(dependency_ids)
+        if dependency_ids:
+            job_info["JobDependencies"] = ",".join(dependency_ids)
+        if options["machine_limit"]:
+            job_info["MachineLimit"] = options["machine_limit"]
+        if options["machine_list"]:
+            key = "Blacklist" if options["machine_list_is_deny"] else "Whitelist"
+            job_info[key] = options["machine_list"]
+
+        version = hou.applicationVersion()
         plugin_info = {
             "SceneFile": hip_path,
             "OutputDriver": node.path(),
-            "Version": "21.0",
+            "Version": "{}.{}".format(version[0], version[1]),
             "Build": "64bit",
             "IgnoreSceneFileFrameRange": True,
+            "IgnoreInputs": True,
             "StartFrame": f1,
             "EndFrame": f2,
         }
-        
+        if step > 1:
+            plugin_info["FrameStep"] = step
+
         # Write temp files
         job_file = tempfile.NamedTemporaryFile(
             mode='w',
@@ -615,17 +894,14 @@ def _submit_generic_rop_to_deadline(node, batch_name, farmer_node_name, farmer_n
         )
         
         try:
-            # Write job info
             for key, value in job_info.items():
                 job_file.write(f"{key}={value}\n")
             job_file.close()
-            
-            # Write plugin info
+
             for key, value in plugin_info.items():
                 plugin_file.write(f"{key}={value}\n")
             plugin_file.close()
-            
-            # Submit to Deadline
+
             cmd = ["deadlinecommand", job_file.name, plugin_file.name]
             result = subprocess.check_output(cmd, stderr=subprocess.STDOUT).decode()
             _LOGGER.debug("Deadline output:\n%s", result.strip())
@@ -635,7 +911,7 @@ def _submit_generic_rop_to_deadline(node, batch_name, farmer_node_name, farmer_n
             if match:
                 job_id = match.group(1)
                 _LOGGER.info("Generic ROP submitted | Node: %s | JobID: %s", node.path(), job_id)
-                return job_id
+                return [job_id]
             
             _LOGGER.error(
                 "Deadline submission failed - JobID not found in output:\n%s",
@@ -663,51 +939,175 @@ def _submit_generic_rop_to_deadline(node, batch_name, farmer_node_name, farmer_n
 
 
 def submit_farmer_to_deadline(farmer_node):
-    # Ensure farmer node has the machine list parameters available
-    if ensure_deadline_machine_list_parms:
-        try:
-            ensure_deadline_machine_list_parms(farmer_node)
-        except Exception:
-            pass
+    """Preflight and submit any connected caches, wedges, and native ROPs."""
+    ensure_deadline_machine_list_parms(farmer_node)
+    nodes, dependencies = _collect_upstream_submit_graph(farmer_node)
+    errors, warnings, graph_lines = _preflight(farmer_node, nodes, dependencies)
 
-    rops = _collect_upstream_submit_nodes(farmer_node)
-    if not rops:
-        hou.ui.displayMessage("No upstream cache/render nodes found.", title="Farmer Error")
-        return
+    if errors:
+        message = "Preflight failed:\n\n- " + "\n- ".join(errors)
+        if warnings:
+            message += "\n\nWarnings:\n- " + "\n- ".join(warnings)
+        hou.ui.displayMessage(message, title="Farmer Preflight")
+        return []
+
+    message = "Ready to submit {} node(s):\n\n{}".format(
+        len(nodes), "\n".join(graph_lines)
+    )
+    if warnings:
+        message += "\n\nWarnings:\n- " + "\n- ".join(warnings)
+    try:
+        if hou.isUIAvailable():
+            choice = hou.ui.displayMessage(
+                message,
+                buttons=("Submit", "Cancel"),
+                default_choice=0,
+                close_choice=1,
+                title="Farmer Preflight",
+            )
+            if choice != 0:
+                return []
+    except AttributeError:
+        pass
 
     context = get_current_context() or {}
     project = context.get("project_name", "project")
     submitted_at = datetime.now().strftime("%Y-%m-%d %H:%M")
     batch_name = "Farm | {} | {} | {}".format(project, farmer_node.name(), submitted_at)
+    options = _farmer_options(farmer_node)
+
+    job_prefix = str(_parm_value(
+        farmer_node, ("jobprefix",), "", True
+    )).strip()
+    submission_root = _get_farmer_submission_root(
+        farmer_node.name(), job_prefix
+    )
+    try:
+        scene_dependencies, dependency_manifest_path = (
+            _save_dependency_manifest(submission_root, farmer_node, context)
+        )
+    except Exception as exc:
+        _LOGGER.exception("Could not collect Farmer scene dependencies")
+        hou.ui.displayMessage(
+            "Could not collect scene dependencies:\n{}".format(exc),
+            title="Farmer Error",
+        )
+        return []
+    hip_path = None
+    context_path = None
+    if any(_is_generic_rop_or_cache(node) for node in nodes):
+        hip_path = _save_hip_file_for_submission(submission_root)
+        context_path = _save_ayon_context_to_file(
+            submission_root,
+            scene_dependencies=scene_dependencies,
+            dependency_manifest_path=dependency_manifest_path,
+        )
+        if not hip_path or not context_path:
+            hou.ui.displayMessage(
+                "Could not create the Farmer HIP snapshot or AYON context file.",
+                title="Farmer Error",
+            )
+            return []
 
     submitted_job_ids = []
-    for rop in rops:
-        job_id = None
-        
-        # Try HDA-based submission first
-        module = _get_hda_module(rop)
-        if module and hasattr(module, "submit_cache_to_deadline"):
-            job_id = _submit_cache_job(module, rop, batch_name=batch_name)
-        # Fall back to generic submission
-        elif _is_generic_rop_or_cache(rop):
-            job_id = _submit_generic_rop_to_deadline(
-                rop,
-                batch_name=batch_name,
-                farmer_node_name=farmer_node.name(),
-                farmer_node=farmer_node
+    job_ids_by_node = {}
+    failed_nodes = []
+    for node in nodes:
+        parent_paths = dependencies.get(node.path(), [])
+        failed_parents = [path for path in parent_paths if not job_ids_by_node.get(path)]
+        if failed_parents:
+            failed_nodes.append(
+                "{} (dependency failed: {})".format(node.path(), ", ".join(failed_parents))
             )
-        
-        if job_id:
-            submitted_job_ids.append(job_id)
-            _LOGGER.info("%s", rop.path())
+            job_ids_by_node[node.path()] = []
+            continue
+        dependency_ids = []
+        for parent_path in parent_paths:
+            dependency_ids.extend(job_ids_by_node.get(parent_path, []))
+
+        try:
+            module = _get_hda_module(node)
+            if _has_submit_hook(node):
+                job_ids = _submit_cache_job(
+                    module,
+                    node,
+                    batch_name=batch_name,
+                    dependency_ids=dependency_ids,
+                    options=options,
+                    scene_dependencies=scene_dependencies,
+                    dependency_manifest_path=dependency_manifest_path,
+                )
+            else:
+                job_ids = _submit_generic_rop_to_deadline(
+                    node,
+                    batch_name=batch_name,
+                    farmer_node=farmer_node,
+                    hip_path=hip_path,
+                    ayon_context_json=context_path,
+                    dependency_ids=dependency_ids,
+                    options=options,
+                    dependency_manifest_path=dependency_manifest_path,
+                )
+        except Exception as exc:
+            _LOGGER.exception("Submission failed for %s", node.path())
+            job_ids = []
+            failed_nodes.append("{} ({})".format(node.path(), exc))
+
+        job_ids = _job_id_list(job_ids)
+        job_ids_by_node[node.path()] = job_ids
+        submitted_job_ids.extend(job_ids)
+        if job_ids:
+            _LOGGER.info("FARMER NODE | %s | %s", node.path(), ", ".join(job_ids))
+        elif not any(item.startswith(node.path() + " (") for item in failed_nodes):
+            failed_nodes.append("{} (Deadline returned no Job ID)".format(node.path()))
 
     if not submitted_job_ids:
         hou.ui.displayMessage("Deadline submission failed.", title="Farmer Error")
-        return
+        return []
+
+    if options["discord_notify"]:
+        try:
+            from ayon_houdini.nodes import farm_report
+
+            report_layers = []
+            for node in nodes:
+                node_job_ids = job_ids_by_node.get(node.path(), [])
+                for index, job_id in enumerate(node_job_ids):
+                    label = node.name()
+                    if len(node_job_ids) > 1:
+                        label += "-{:02d}".format(index + 1)
+                    report_layers.append({"name": label, "job_id": job_id})
+            report_host_job_id = submitted_job_ids[-1]
+            farm_report.attach_report_to_job(
+                deadline_command=(
+                    shutil.which("deadlinecommand") or "deadlinecommand"
+                ),
+                host_job_id=report_host_job_id,
+                dependency_job_ids=submitted_job_ids,
+                report_root=os.path.join(submission_root, "farm_report"),
+                layers=report_layers,
+                project=project,
+                shot=context.get("folder_path", ""),
+                task=context.get("task_name", ""),
+            )
+            _LOGGER.info(
+                "FARMER DISCORD | Attached to JobID: %s",
+                report_host_job_id,
+            )
+        except Exception as exc:
+            _LOGGER.exception("Could not attach the Farmer Discord notifier")
+            failed_nodes.append("Discord notification ({})".format(exc))
 
     _LOGGER.info(
         "FARMER SUBMIT | Submitted: %d/%d | JobIDs: %s",
         len(submitted_job_ids),
-        len(rops),
+        len(nodes),
         ", ".join(submitted_job_ids),
     )
+    result_message = "Submitted {} job(s) from {} node(s).".format(
+        len(submitted_job_ids), len(nodes) - len(failed_nodes)
+    )
+    if failed_nodes:
+        result_message += "\n\nNot submitted:\n- " + "\n- ".join(failed_nodes)
+    hou.ui.displayMessage(result_message, title="Farmer")
+    return submitted_job_ids

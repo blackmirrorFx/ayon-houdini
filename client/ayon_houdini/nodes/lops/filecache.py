@@ -3,6 +3,7 @@ import logging
 import os
 import re
 from ayon_core.pipeline import get_current_context
+from ayon_houdini.api.file_permissions import read_only_source
 import json
 import shutil
 import tempfile
@@ -33,25 +34,32 @@ _DEADLINE_MACHINE_LIST_PARM = "machine_list"
 _DEADLINE_MACHINE_DENYLIST_PARM = "machine_list_is_deny"
 
 
-def _build_default_batch_name(node, version):
+def _deadline_name_root(node, version):
+    """Return the Render Dispatcher-style Deadline identity."""
     context = get_current_context() or {}
-    project = str(context.get("project_name") or "UNKNOWN_PROJECT").upper()
-    folder_path = (context.get("folder_path") or "").strip("/")
-    shot = (os.path.basename(folder_path) or "UNKNOWN_SHOT").upper()
-    department = str(
-        context.get("task_name") or "UNKNOWN_DEPARTMENT"
-    ).upper()
-    return "{}_{}_{}_{}_v{:03d}".format(
-        project,
-        shot,
-        department,
-        node.name(),
-        int(version),
+    folder_path = str(context.get("folder_path") or "").rstrip("/\\")
+    values = (
+        context.get("project_name") or "UnknownProject",
+        os.getenv("SHOT")
+        or os.getenv("AYON_SHOT_NAME")
+        or os.path.basename(folder_path)
+        or "UnknownShot",
+        context.get("task_name") or "UnknownTask",
+        node.name() or "FileCache",
+        "v{:03d}".format(int(version)),
+    )
+    return " | ".join(
+        re.sub(r"\s*\|\s*", "-", str(value)).strip()
+        for value in values
     )
 
 
+def _build_default_batch_name(node, version):
+    return _deadline_name_root(node, version)
+
+
 def _build_deadline_job_name(node, version):
-    return "{}_v{:03d}".format(node.name(), int(version))
+    return _deadline_name_root(node, version)
 
 
 def _deadline_bin_directory():
@@ -482,7 +490,8 @@ def save_hip_to_version_dir(node, version):
     # without renaming/saving the artist's main scene file.
     try:
         hscript_dst = dst.replace("\\", "/").replace('"', '\\"')
-        hou.hscript(f'mwrite -n "{hscript_dst}"')
+        with read_only_source(dst):
+            hou.hscript(f'mwrite -n "{hscript_dst}"')
     except hou.OperationFailed as exc:
         raise RuntimeError(
             f"Failed to save snapshot HIP to {dst}: {exc}"
@@ -1547,7 +1556,7 @@ def _submit_master_wrapper_job(
 
     job_info = {
         "Plugin": "CommandLine",
-        "Name": _build_deadline_job_name(node, version) + "_master",
+        "Name": _build_deadline_job_name(node, version) + " | Master",
         "Frames": "0",
         "ChunkSize": 1,
         "Pool": "houdini",

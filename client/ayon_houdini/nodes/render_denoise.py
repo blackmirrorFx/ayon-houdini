@@ -65,17 +65,21 @@ def finalize_denoise(input_template, output_dir, start, end, padding=4):
     """Replace the raw sequence only after every staged frame validates."""
     if int(end) < int(start):
         raise ValueError("Invalid denoise finalize frame range.")
+    _emit_progress(0)
     _validate_inputs(input_template, start, end, padding)
+    _emit_progress(10)
     resolved = _collect_denoised_outputs(
         input_template, output_dir, start, end, padding
     )
-    _emit_progress(0)
+    _emit_progress(30)
     total = float(len(resolved))
     for index, (candidate, original) in enumerate(resolved, 1):
         os.replace(candidate, original)
         print("Replaced source render: {}".format(original), flush=True)
-        _emit_progress(index * 100.0 / total)
+        _emit_progress(30 + index * 65.0 / total)
+    _emit_progress(98)
     shutil.rmtree(output_dir, ignore_errors=True)
+    _emit_progress(100)
 
 
 def run_denoise(
@@ -102,12 +106,15 @@ def run_denoise(
     if start < sequence_start or end > sequence_end:
         raise ValueError("Denoise target range is outside the sequence range.")
 
+    _emit_progress(0)
     is_animation = sequence_end > sequence_start
     effective_handles = handles if is_animation else 0
     context_start = max(sequence_start, start - effective_handles)
     context_end = min(sequence_end, end + effective_handles)
     _validate_inputs(input_template, context_start, context_end, padding)
+    _emit_progress(3)
     os.makedirs(output_dir, exist_ok=True)
+    _emit_progress(5)
 
     command = [executable]
     if is_animation:
@@ -131,7 +138,6 @@ def run_denoise(
         flush=True,
     )
     print("RenderMan denoise command: {}".format(" ".join(command)), flush=True)
-    _emit_progress(0)
     process = subprocess.Popen(
         command,
         stdout=subprocess.PIPE,
@@ -145,14 +151,18 @@ def run_denoise(
         line = line.rstrip()
         print(line, flush=True)
         match = re.search(
-            r"(?:ALF_PROGRESS|Progress:?)[^0-9]*([0-9]+(?:\.[0-9]+)?)%?",
+            r"(?:ALF_PROGRESS|Progress:?|R90000)"
+            r"[^0-9]*([0-9]+(?:\.[0-9]+)?)%?",
             line,
             re.IGNORECASE,
         )
         if match:
             progress = int(float(match.group(1)))
             if progress != last_progress:
-                _emit_progress(progress)
+                # Reserve the first 5% for validation and the final 1% for
+                # successful process completion. This keeps Deadline moving
+                # during setup without ever reporting success too early.
+                _emit_progress(5 + progress * 0.94)
                 last_progress = progress
     return_code = process.wait()
     if return_code:

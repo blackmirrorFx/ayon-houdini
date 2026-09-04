@@ -62,6 +62,18 @@ def _validate_inputs(template, start, end, padding):
         )
 
 
+def _prores_transfer_value(transfer):
+    """Return a value accepted by FFmpeg's prores_metadata filter.
+
+    The filter exposes only a subset of transfer characteristics by name in
+    some AYON FFmpeg builds. It still accepts the standard numeric enum value;
+    IEC 61966-2-1 (sRGB) is value 13.
+    """
+    if str(transfer).lower() == "iec61966-2-1":
+        return "13"
+    return str(transfer)
+
+
 def create_movies(
     ffmpeg,
     ocio_config,
@@ -99,43 +111,49 @@ def create_movies(
         output_matrix,
     )):
         raise RuntimeError("OCIO transform and video color metadata are required.")
+    _emit_progress(0)
     _validate_inputs(input_template, start, end, padding)
+    _emit_progress(3)
 
     for path in (mov_path, mp4_path):
         os.makedirs(os.path.dirname(path), exist_ok=True)
     work_root = tempfile.mkdtemp(prefix="bmfx_review_", dir=os.path.dirname(mov_path))
+    _emit_progress(5)
     environment = os.environ.copy()
     environment["OCIO"] = ocio_config
     try:
+        import OpenImageIO as oiio
+
         frame_count = end - start + 1
         staged_template = os.path.join(work_root, "review.%0{}d.tif".format(padding))
-        _emit_progress(0)
         for index, frame in enumerate(range(start, end + 1), 1):
+            frame_start_progress = 5 + (index - 1) * 50.0 / frame_count
+            frame_progress_span = 50.0 / frame_count
             source = _frame_path(input_template, frame, padding)
             staged = os.path.join(
                 work_root, "review.{}.tif".format(str(frame).zfill(padding))
             )
             # 16-bit TIFF retains sufficient precision for ProRes 422 HQ.
-            import OpenImageIO as oiio
-
             source_buf = oiio.ImageBuf(source)
             if source_buf.has_error:
                 raise RuntimeError(source_buf.geterror())
+            _emit_progress(frame_start_progress + frame_progress_span * 0.10)
             channel_names = list(source_buf.spec().channelnames)
             rgb_indices = []
             for candidates in (("R", "Ci.R", "Ci.r"), ("G", "Ci.G", "Ci.g"), ("B", "Ci.B", "Ci.b")):
-                index = next(
+                channel_index = next(
                     (channel_names.index(name) for name in candidates if name in channel_names),
                     None,
                 )
-                if index is None:
+                if channel_index is None:
                     raise RuntimeError(
                         "No RGB/Ci beauty channels were found in {}.".format(source)
                     )
-                rgb_indices.append(index)
+                rgb_indices.append(channel_index)
             beauty_buf = oiio.ImageBufAlgo.channels(
                 source_buf, tuple(rgb_indices), ("R", "G", "B")
             )
+            _emit_progress(frame_start_progress + frame_progress_span * 0.30)
             display_buf = oiio.ImageBufAlgo.ociodisplay(
                 beauty_buf,
                 display,
@@ -145,6 +163,7 @@ def create_movies(
             )
             if display_buf.has_error:
                 raise RuntimeError(display_buf.geterror())
+            _emit_progress(frame_start_progress + frame_progress_span * 0.65)
             display_buf.set_write_format(oiio.UINT16)
             if not display_buf.write(staged):
                 raise RuntimeError(
@@ -152,7 +171,7 @@ def create_movies(
                         staged, display_buf.geterror()
                     )
                 )
-            _emit_progress(index * 55.0 / frame_count)
+            _emit_progress(frame_start_progress + frame_progress_span)
 
         duration = frame_count / fps
         common = [
@@ -188,7 +207,9 @@ def create_movies(
                 "-progress", "pipe:1", "-i", mov_encoded, "-c", "copy",
                 "-bsf:v",
                 "prores_metadata=color_primaries={}:color_trc={}:colorspace={}".format(
-                    output_primaries, output_transfer, output_matrix
+                    output_primaries,
+                    _prores_transfer_value(output_transfer),
+                    output_matrix,
                 ),
                 "-color_primaries", output_primaries,
                 "-color_trc", output_transfer,
@@ -213,11 +234,13 @@ def create_movies(
             ],
             environment=environment,
             progress_start=78,
-            progress_end=100,
+            progress_end=98,
             duration=duration,
         )
         os.replace(mov_temp, mov_path)
+        _emit_progress(99)
         os.replace(mp4_temp, mp4_path)
+        _emit_progress(100)
     finally:
         shutil.rmtree(work_root, ignore_errors=True)
 

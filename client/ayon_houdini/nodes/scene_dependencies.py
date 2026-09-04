@@ -8,6 +8,7 @@ requiring Houdini or USD when the publish is inspected later.
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path
 
 
@@ -21,7 +22,17 @@ _TEXTURE_EXTENSIONS = {
     "bmp", "tga", "hdr", "pic",
 }
 _SCENE_EXTENSIONS = {"hip", "hiplc", "hipnc"}
+_DEPENDENCY_EXTENSIONS = (
+    _USD_EXTENSIONS | _CACHE_EXTENSIONS | _MODEL_EXTENSIONS
+    | _TEXTURE_EXTENSIONS | _SCENE_EXTENSIONS
+)
 _MULTI_EXTENSIONS = ("bgeo.sc", "ass.gz")
+_FRAME_BEFORE_EXTENSION = re.compile(
+    r"(?<![vV])(?<!\d)\d{3,8}(?=\.(?:"
+    r"exr|dpx|jpg|jpeg|png|tif|tiff|bgeo(?:\.sc)?|vdb|abc|ass(?:\.gz)?"
+    r")$)",
+    re.IGNORECASE,
+)
 
 
 def _extension(path):
@@ -53,6 +64,84 @@ def dependency_kind(path, product_type="", representation_name=""):
     return "reference"
 
 
+def dependency_role(path="", product_name="", product_type="", node_path=""):
+    """Return a production-facing department for an asset dependency."""
+    value = " {} {} {} {} ".format(
+        path, product_name, product_type, node_path
+    ).lower()
+    rules = (
+        ("camera", ("camera", "_cam", "cam_", "/cam")),
+        ("layout", ("layout", "setdress", "set_dress")),
+        ("animation", ("animation", "_anim", "anim_", "/anim")),
+        ("fx", ("/fx", "_fx", "fx_", "simulation", "simcache", "vdb", "bgeo")),
+        ("character", ("character", "char_", "_char", "rig")),
+        ("environment", ("environment", "env_", "_env", "/env")),
+        ("model", ("model", "geometry", "geo_", "_geo")),
+        ("texture", ("texture", "lookdev", "shader", "material")),
+        ("lighting", ("lighting", "light_", "_light")),
+    )
+    for role, tokens in rules:
+        if any(token in value for token in tokens):
+            return role
+    kind = dependency_kind(path, product_type)
+    return {
+        "usd": "layout", "cache": "fx", "model": "model",
+        "texture": "texture", "scene": "source",
+    }.get(kind, "other")
+
+
+def sequence_dependency_path(path):
+    """Collapse a resolved frame to one dependency identity."""
+    return _FRAME_BEFORE_EXTENSION.sub("####", str(path or ""))
+
+
+def is_asset_dependency_path(path):
+    """Reject callback scripts and arbitrary string parameters."""
+    value = str(path or "").strip()
+    if not value or "\n" in value or "\r" in value:
+        return False
+    if not any(marker in value for marker in ("/", "\\", "$", "{root", "ayon://")):
+        return False
+    return _extension(value) in _DEPENDENCY_EXTENSIONS
+
+
+def _is_output_reference(parm, node_path):
+    lowered_path = str(node_path or "").lower()
+    if lowered_path.startswith("/out/") or "/ropnet/" in lowered_path:
+        return True
+    try:
+        node = parm.node()
+        type_name = node.type().name().lower()
+        category = node.type().category().name().lower()
+        parm_name = parm.name().lower()
+    except Exception:
+        return False
+    if category == "driver":
+        return True
+    return (
+        type_name in {
+            "alembic", "geometry", "ifd", "rop_geometry", "rop_alembic",
+            "usd_rop", "usdrender", "usd_render", "filmboxfbx",
+        }
+        and parm_name in {
+            "output", "outputimage", "sopoutput", "lopoutput", "vm_picture",
+        }
+    )
+
+
+def _asset_label(path):
+    parts = [part for part in str(path).replace("\\", "/").split("/") if part]
+    lowered = [part.lower() for part in parts]
+    if "publish" in lowered:
+        index = lowered.index("publish")
+        if len(parts) > index + 2:
+            return parts[index + 2]
+    name = os.path.basename(sequence_dependency_path(path)) or path
+    if name.lower().startswith(("main.", "file1.")) and len(parts) > 1:
+        return "{} · {}".format(parts[-2], name)
+    return name
+
+
 def _clean_path(path, hou_module=None):
     value = str(path or "").strip()
     if not value or value.startswith("anon:"):
@@ -69,6 +158,8 @@ def _clean_path(path, hou_module=None):
 
 
 def _record_key(record):
+    if not record.get("representation_id") and not record.get("version_id"):
+        return (record.get("source") or "", record.get("path") or "")
     return (
         record.get("representation_id") or "",
         record.get("version_id") or "",
@@ -164,6 +255,9 @@ def _collect_containers(project_name):
                 product.get("productType"),
                 representation.get("name"),
             ),
+            "role": dependency_role(
+                path, product_name, product.get("productType"), node_path
+            ),
             "source": "AYON container",
             "path": _clean_path(path),
             "node_path": node_path,
@@ -251,6 +345,7 @@ def _collect_usd_stage(stage, hou_module=None):
         output.append({
             "label": Path(path.split("?", 1)[0]).name or path,
             "kind": dependency_kind(path),
+            "role": dependency_role(path),
             "source": "USD stage",
             "path": path,
             "node_path": "",
@@ -272,6 +367,8 @@ def _collect_file_references(hou_module):
         return []
     output = []
     for parm, raw_path in references:
+        if not is_asset_dependency_path(raw_path):
+            continue
         try:
             tags = parm.parmTemplate().tags() if parm is not None else {}
         except Exception:
@@ -290,9 +387,13 @@ def _collect_file_references(hou_module):
             node_path = parm.node().path() if parm is not None else ""
         except Exception:
             node_path = ""
+        if _is_output_reference(parm, node_path):
+            continue
+        path = sequence_dependency_path(path)
         output.append({
-            "label": Path(path.split("?", 1)[0]).name or path,
+            "label": _asset_label(path),
             "kind": dependency_kind(path),
+            "role": dependency_role(path=path, node_path=node_path),
             "source": "Houdini file reference",
             "path": path,
             "node_path": node_path,

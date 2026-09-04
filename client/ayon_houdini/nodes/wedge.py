@@ -12,6 +12,7 @@ import sys
 from datetime import datetime
 
 from ayon_core.pipeline import get_current_context
+from ayon_houdini.api.file_permissions import read_only_source
 
 
 _LOGGER = logging.getLogger("BMFX.Wedge")
@@ -1140,11 +1141,15 @@ def ayon_context_json_path(node, version):
     return os.path.join(version_dir(node, version, create=True), ".ayon_vars.json")
 
 
-def save_ayon_context_for_node(node, version):
+def save_ayon_context_for_node(
+    node, version, scene_dependencies=None, dependency_manifest_path=None
+):
     data = {
         "launcher_env": get_ayon_launcher_env(),
         "houdini_vars": filter_custom_houdini_vars(get_all_houdini_vars()),
         "pipeline_env": get_pipeline_env(),
+        "bmfx_scene_dependencies": scene_dependencies or {},
+        "bmfx_dependency_manifest": dependency_manifest_path or "",
     }
     out_path = ayon_context_json_path(node, version)
     with open(out_path, "w") as stream:
@@ -1499,7 +1504,8 @@ def _save_hip_to_wedge_dir(node, version, wedge_index):
     dst = os.path.join(hip_dir, "source.hip")
     escaped = dst.replace("\\", "/").replace('"', '\\"')
     try:
-        hou.hscript(f'mwrite -n "{escaped}"')
+        with read_only_source(dst):
+            hou.hscript(f'mwrite -n "{escaped}"')
     except hou.OperationFailed as exc:
         raise RuntimeError(f"Failed to save wedge HIP snapshot: {dst}") from exc
     return dst
@@ -1516,14 +1522,34 @@ def _write_values_json(node, version, wedge_index, wedge_values):
     return out_path
 
 
+def _deadline_name_root(node, version):
+    """Return the Render Dispatcher-style Deadline identity."""
+    context = get_current_context() or {}
+    folder_path = str(context.get("folder_path") or "").rstrip("/\\")
+    values = (
+        context.get("project_name") or "UnknownProject",
+        os.getenv("SHOT")
+        or os.getenv("AYON_SHOT_NAME")
+        or os.path.basename(folder_path)
+        or "UnknownShot",
+        context.get("task_name") or "UnknownTask",
+        node.name() or "WedgeCache",
+        "v{:03d}".format(int(version)),
+    )
+    return " | ".join(
+        re.sub(r"\s*\|\s*", "-", str(value)).strip()
+        for value in values
+    )
+
+
 def _build_job_name(node, wedge_index, version):
-    hip_name = os.path.splitext(hou.hipFile.basename())[0] or "untitled"
-    return f"{hip_name} | {node.name()} | v{int(version):03d} | w{int(wedge_index)}"
+    return "{} | w{}".format(
+        _deadline_name_root(node, version), int(wedge_index)
+    )
 
 
-def _build_batch_name(node):
-    hip_name = os.path.splitext(hou.hipFile.basename())[0] or "untitled"
-    return f"{hip_name} | {node.name()}"
+def _build_batch_name(node, version):
+    return _deadline_name_root(node, version)
 
 
 def _get_node_priority(node):
@@ -1603,6 +1629,15 @@ def _deadline_command():
     if command:
         return command
     return "deadlinecommand"
+
+
+def _deadline_bin_directory():
+    """Return Deadline's bin directory for Houdini's farm-side helper."""
+    deadline_path = str(os.environ.get("DEADLINE_PATH") or "").strip()
+    if deadline_path:
+        return deadline_path
+    command = shutil.which("deadlinecommand")
+    return os.path.dirname(command) if command else ""
 
 
 def _submit_job_to_deadline(job_info, plugin_info):
@@ -2279,11 +2314,10 @@ def _submit_wedge_flipbook_images_job(
         json.dump(payload, stream, indent=4)
     _build_wedge_flipbook_images_deadline_script(script_path)
 
-    hip_name = os.path.splitext(hou.hipFile.basename())[0] or "untitled"
     job_info = {
         "Plugin": "CommandLine",
         "BatchName": batch_name,
-        "Name": f"{hip_name} | {node.name()} | v{int(version):03d} | wedge_flipbook_images",
+        "Name": _deadline_name_root(node, version) + " | Review Images",
         "Frames": "0-0",
         "ChunkSize": 1,
         "Pool": pool_name or "houdini",
@@ -2648,11 +2682,10 @@ def _submit_wedge_review_job(
         json.dump(payload, stream, indent=4)
     _build_wedge_review_deadline_script(script_path)
 
-    hip_name = os.path.splitext(hou.hipFile.basename())[0] or "untitled"
     job_info = {
         "Plugin": "CommandLine",
         "BatchName": batch_name,
-        "Name": f"{hip_name} | {node.name()} | v{int(version):03d} | wedge_flipbook_merge",
+        "Name": _deadline_name_root(node, version) + " | Review Media",
         "Frames": "0-0",
         "ChunkSize": 1,
         "Pool": pool_name or "houdini",
@@ -2714,6 +2747,8 @@ def submit_wedges_to_deadline(
     machine_limit=None,
     machine_list=None,
     machine_list_is_deny=None,
+    scene_dependencies=None,
+    dependency_manifest_path=None,
 ):
     if hou.hipFile.path() == "untitled.hip":
         raise RuntimeError("Please save the Houdini scene before submitting wedges.")
@@ -2726,7 +2761,20 @@ def submit_wedges_to_deadline(
     f1, f2, step = _frame_range(node)
 
     version = active_version(node)
-    json_path = save_ayon_context_for_node(node, version)
+    if scene_dependencies:
+        local_manifest = os.path.join(
+            version_dir(node, version, create=True),
+            "scene_dependencies.json",
+        )
+        with open(local_manifest, "w") as stream:
+            json.dump(scene_dependencies, stream, indent=2, sort_keys=True)
+        dependency_manifest_path = local_manifest
+    json_path = save_ayon_context_for_node(
+        node,
+        version,
+        scene_dependencies=scene_dependencies,
+        dependency_manifest_path=dependency_manifest_path,
+    )
     rop = _get_active_rop(node)
     output_parm = _get_output_parm(node, rop)
     set_output_path_on_submit = _should_set_output_path_on_submit(node)
@@ -2737,7 +2785,7 @@ def submit_wedges_to_deadline(
     chunk_size = _get_chunk_size(node, f1, f2, step)
     frames = _frames_for_deadline(f1, f2, step)
 
-    batch_name = batch_name or _build_batch_name(node)
+    batch_name = batch_name or _build_batch_name(node, version)
     (
         normalized_machine_limit,
         normalized_machine_list,
@@ -2801,9 +2849,30 @@ def submit_wedges_to_deadline(
                 "EnvironmentKeyValue2": f"BMFX_WEDGE_VALUES_JSON={values_json}",
                 "EnvironmentKeyValue3": f"BMFX_FROZEN_VERSION={version}",
             }
+            environment_index = 4
+            # Deadline's Houdini hrender_dl.py launches deadlinecommand again
+            # while path-mapping the HIP. Worker service environments often
+            # omit Deadline's bin directory from PATH, so pass the explicit
+            # location exactly as BMFX File Cache does.
+            deadline_bin = _deadline_bin_directory()
+            if deadline_bin:
+                job_info[f"EnvironmentKeyValue{environment_index}"] = (
+                    f"DEADLINE_PATH={deadline_bin}"
+                )
+                environment_index += 1
+            if dependency_manifest_path:
+                job_info[f"EnvironmentKeyValue{environment_index}"] = (
+                    f"BMFX_SCENE_DEPENDENCIES_JSON={dependency_manifest_path}"
+                )
 
             if dependent_job_id:
-                job_info["JobDependency0"] = dependent_job_id
+                dependency_value = str(dependent_job_id)
+                key = (
+                    "JobDependencies"
+                    if "," in dependency_value
+                    else "JobDependency0"
+                )
+                job_info[key] = dependency_value
             if normalized_machine_limit:
                 job_info["MachineLimit"] = normalized_machine_limit
             if normalized_machine_list:

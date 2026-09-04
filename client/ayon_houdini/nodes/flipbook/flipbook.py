@@ -10,6 +10,7 @@ from datetime import datetime
 
 import hou
 from ayon_core.lib import get_ffmpeg_tool_args
+from ayon_houdini.api.file_permissions import read_only_source
 from qtpy import QtCore, QtGui, QtWidgets
 
 log = logging.getLogger("ayon.flipbook")
@@ -868,7 +869,8 @@ class FlipbookShelfTool(QtWidgets.QDialog):
         dst = os.path.join(hip_dir, "source.v{:03d}.hip".format(int(version_number)))
         try:
             hscript_dst = dst.replace("\\", "/").replace('"', '\\"')
-            hou.hscript('mwrite -n "{}"'.format(hscript_dst))
+            with read_only_source(dst):
+                hou.hscript('mwrite -n "{}"'.format(hscript_dst))
         except hou.OperationFailed as exc:
             raise RuntimeError(
                 "Failed to save snapshot HIP to {}: {}".format(dst, exc)

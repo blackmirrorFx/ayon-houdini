@@ -3,25 +3,34 @@ import re
 import copy
 import glob
 import sys
+import json
 import hashlib
+import logging
 import shutil
 import platform
 import subprocess
-from datetime import datetime
+import uuid
+from datetime import datetime, timezone
 
+import ayon_api
 from ayon_api import (
     create_product,
     create_representation,
+    create_thumbnail,
     create_version,
     get_folder_by_path,
     get_last_version_by_product_id,
     get_product_by_name,
     get_project_roots_for_site,
     get_tasks,
+    update_version,
     upload_reviewable,
 )
 from ayon_api.utils import create_entity_id
 from ayon_core.lib import get_ffmpeg_tool_args
+
+
+_LOGGER = logging.getLogger("BMFX.DirectPublish")
 
 
 _FRAME_TOKEN_PATTERN = re.compile(r"\$F(\d*)")
@@ -42,6 +51,133 @@ _IMAGE_SEQUENCE_EXTENSIONS = {
     "tga",
     "exr",
 }
+
+
+def _new_bmfx_uid(label):
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    return "BMFX-{}-{}-{}".format(
+        label, stamp, uuid.uuid4().hex[:12].upper()
+    )
+
+
+def _bmfx_kind(product_type, path_or_paths=None):
+    """Return the stable package kind stored for BMFX Browser."""
+    product_type = str(product_type or "").strip().lower()
+    if product_type in {"render", "rendering"}:
+        return "render"
+    if product_type in {"review", "playblast", "flipbook"}:
+        return "playblast"
+    if product_type == "usd":
+        return "usd"
+    if isinstance(path_or_paths, (list, tuple, set)):
+        first_path = next(iter(path_or_paths), "")
+    else:
+        first_path = path_or_paths or ""
+    extension = _extract_extension(str(first_path)).lower()
+    if extension in {"usd", "usda", "usdc", "usdz"}:
+        return "usd"
+    if extension in {"bgeo", "bgeo.sc", "geo"}:
+        return "bgeo"
+    if extension == "abc":
+        return "alembic"
+    if extension == "vdb":
+        return "vdb"
+    if extension in _IMAGE_SEQUENCE_EXTENSIONS:
+        return "render"
+    if extension in {"mov", "mp4", "webm", "mxf"}:
+        return "playblast"
+    return "other"
+
+
+def _bmfx_version_data(
+    version_data=None, product_type=None, path_or_paths=None
+):
+    """Add durable identifiers understood by BMFX Browser and DCC loaders."""
+    data = dict(version_data or {})
+    data.setdefault("bmfxPackageId", _new_bmfx_uid("PKG"))
+    data.setdefault("bmfxExecutionId", _new_bmfx_uid("EXEC"))
+    data.setdefault("bmfxUidSchema", 1)
+    data.setdefault("bmfxKind", _bmfx_kind(product_type, path_or_paths))
+    return data
+
+
+def _current_scene_dependencies(project_name):
+    """Collect the live Houdini scene without making direct publish Houdini-only."""
+    manifest_path = os.getenv("BMFX_SCENE_DEPENDENCIES_JSON", "").strip()
+    if manifest_path and os.path.isfile(manifest_path):
+        try:
+            with open(manifest_path, "r") as stream:
+                payload = json.load(stream)
+            if isinstance(payload, dict) and "records" in payload:
+                return payload
+        except (OSError, ValueError):
+            _LOGGER.warning(
+                "Could not read Farmer dependency manifest %s",
+                manifest_path,
+                exc_info=True,
+            )
+    try:
+        from .scene_dependencies import collect_scene_dependencies
+    except (ImportError, ValueError):
+        try:
+            from nodes.scene_dependencies import collect_scene_dependencies
+        except ImportError:
+            return {"schema_version": 1, "records": [], "input_versions": []}
+    try:
+        import hou
+    except Exception:
+        hou = None
+    stage = None
+    if hou is not None:
+        try:
+            selected = hou.selectedNodes()
+        except Exception:
+            selected = []
+        for node in selected:
+            stage_method = getattr(node, "stage", None)
+            if callable(stage_method):
+                try:
+                    stage = stage_method()
+                except Exception:
+                    stage = None
+                if stage is not None:
+                    break
+    return collect_scene_dependencies(
+        project_name=project_name, stage=stage, hou_module=hou
+    )
+
+
+def _create_dependency_links(project_name, output_version_id, dependencies):
+    """Create AYON links for direct publishes, which bypass Pyblish."""
+    create_link = getattr(ayon_api, "create_link", None)
+    if create_link is None:
+        _LOGGER.warning(
+            "This AYON API does not support create_link; dependency metadata "
+            "was stored without server links."
+        )
+        return
+    for input_version_id in dependencies.get("input_version_ids") or []:
+        if not input_version_id or input_version_id == output_version_id:
+            continue
+        try:
+            create_link(
+                project_name=project_name,
+                link_type_name="generative",
+                input_id=input_version_id,
+                input_type="version",
+                output_id=output_version_id,
+                output_type="version",
+                data={"source": "bmfxSceneDependencies"},
+            )
+        except Exception:
+            # Metadata remains authoritative and lets the browser show the
+            # dependency even on older AYON servers or for an existing link.
+            _LOGGER.warning(
+                "Could not create dependency link %s -> %s",
+                input_version_id,
+                output_version_id,
+                exc_info=True,
+            )
 
 
 def _normalize_path(path):
@@ -857,12 +993,47 @@ def _drawtext_filter(
     )
 
 
+def _review_video_transfer():
+    """Return the transfer tag for Houdini's configured display transform."""
+    try:
+        from ayon_houdini.api.lib import get_color_management_preferences
+
+        preferences = get_color_management_preferences() or {}
+    except Exception:
+        preferences = {}
+    transform_name = "{} {}".format(
+        preferences.get("display") or "",
+        preferences.get("view") or "",
+    ).lower()
+    return "iec61966-2-1" if "srgb" in transform_name else "bt709"
+
+
 def _default_reviewable_encode_args(encode_profile="hq"):
     # Keep this close to AYON publish defaults for review outputs:
-    # h264/yuv420p + faststart + all-intra GOP.
+    # h264/yuv420p + faststart + all-intra GOP. Review frames have already had
+    # Houdini's display transform applied, so identify that transfer alongside
+    # legal-range Rec.709 primaries/matrix. Leaving these fields unspecified
+    # makes applications such as xStudio infer different input transforms for
+    # the EXR sequence and its MP4 derivative, which visibly changes gamma and
+    # saturation.
+    output_transfer = _review_video_transfer()
+    color_args = [
+        "-color_primaries",
+        "bt709",
+        "-color_trc",
+        output_transfer,
+        "-colorspace",
+        "bt709",
+        "-color_range",
+        "tv",
+        "-x264-params",
+        "colorprim=bt709:transfer={}:colormatrix=bt709:fullrange=off".format(
+            output_transfer
+        ),
+    ]
     profile = str(encode_profile or "hq").strip().lower()
     if profile in {"fast", "preview"}:
-        return [
+        return color_args + [
             "-c:v",
             "libx264",
             "-preset",
@@ -874,11 +1045,11 @@ def _default_reviewable_encode_args(encode_profile="hq"):
             "-g",
             "12",
             "-movflags",
-            "+faststart",
+            "+faststart+write_colr",
             "-an",
         ]
 
-    return [
+    return color_args + [
         "-c:v",
         "libx264",
         "-crf",
@@ -888,7 +1059,7 @@ def _default_reviewable_encode_args(encode_profile="hq"):
         "-g",
         "1",
         "-movflags",
-        "+faststart",
+        "+faststart+write_colr",
         "-an",
     ]
 
@@ -1312,6 +1483,95 @@ def _merge_unique_tags(base_tags, extra_tags):
     return output
 
 
+def _register_result_representation(
+    result,
+    path_or_paths,
+    representation_name,
+    representation_data=None,
+    representation_tags=None,
+):
+    """Register another physical resource on an existing AYON version."""
+    resource_ids = result.setdefault("resource_representation_ids", {})
+    if representation_name in resource_ids:
+        return resource_ids[representation_name]
+
+    filepaths, missing = collect_paths(path_or_paths)
+    if missing:
+        raise RuntimeError(
+            "Missing {} resource: {}".format(
+                representation_name, ", ".join(missing[:3])
+            )
+        )
+    if not filepaths:
+        raise RuntimeError(
+            "No files found for {} resource.".format(representation_name)
+        )
+
+    extension = _extract_extension(filepaths[0]).lower()
+    published_path, path_template, representation_context = (
+        _representation_path_metadata(
+            filepaths=filepaths,
+            project_name=result["project_name"],
+            representation_name=representation_name,
+            extension=extension,
+        )
+    )
+    data = dict(representation_data or {})
+    data.setdefault("bmfxLocalPublished", True)
+    data.setdefault("googleDriveSynced", False)
+    data.setdefault("bmfxResourceKind", _bmfx_kind(None, filepaths))
+    supplied_context = data.get("context") or {}
+    representation_context.update(supplied_context)
+    data["context"] = representation_context
+    if len(filepaths) > 1:
+        data.setdefault("sequence", True)
+
+    representation_id = create_representation(
+        project_name=result["project_name"],
+        name=representation_name,
+        version_id=result["version_id"],
+        files=_representation_files_payload(
+            filepaths, result["project_name"]
+        ),
+        attrib={
+            "path": published_path,
+            "template": path_template,
+        },
+        data=data,
+        tags=representation_tags,
+    )
+    resource_ids[representation_name] = representation_id
+    return representation_id
+
+
+def _attach_result_thumbnail(result):
+    """Use the first flipbook frame as the AYON version thumbnail."""
+    files = result.get("files") or []
+    if (
+        not files
+        or _extract_extension(files[0]).lower()
+        not in _IMAGE_SEQUENCE_EXTENSIONS
+    ):
+        return None
+    try:
+        thumbnail_id = create_thumbnail(
+            project_name=result["project_name"],
+            src_filepath=files[0],
+        )
+        update_version(
+            project_name=result["project_name"],
+            version_id=result["version_id"],
+            thumbnail_id=thumbnail_id,
+        )
+    except Exception as exc:
+        # Thumbnail failure must not invalidate otherwise usable resources.
+        result["thumbnail_error"] = str(exc)
+        return None
+    result["thumbnail_id"] = thumbnail_id
+    result["thumbnail_error"] = None
+    return thumbnail_id
+
+
 def upload_online_reviewable_for_result(
     result,
     reviewable_label=None,
@@ -1325,6 +1585,17 @@ def upload_online_reviewable_for_result(
         burnin_mode=burnin_mode,
         encode_profile=encode_profile,
         burnin_preset=burnin_preset,
+    )
+    extension = _extract_extension(reviewable_path).lower()
+    _register_result_representation(
+        result,
+        reviewable_path,
+        representation_name=extension or "review",
+        representation_data={
+            "preview": True,
+            "role": "review",
+        },
+        representation_tags=["review", "webreview"],
     )
     label = reviewable_label or "{}_v{:03d}".format(
         result["product_name"],
@@ -1377,6 +1648,7 @@ def publish_files(
     representation_data=None,
     representation_tags=None,
     representation_attrib=None,
+    scene_dependencies=None,
 ):
     if not product_name:
         raise RuntimeError("Product name cannot be empty.")
@@ -1457,6 +1729,12 @@ def publish_files(
     if frame_start is not None or frame_end is not None:
         final_version_attrib.setdefault("fps", _get_review_fps(default=24.0))
 
+    final_version_data = _bmfx_version_data(
+        version_data, product_type, path_or_paths
+    )
+    if scene_dependencies is None:
+        scene_dependencies = _current_scene_dependencies(project_name)
+    final_version_data.setdefault("bmfxSceneDependencies", scene_dependencies)
     version_id = create_version(
         project_name=project_name,
         product_id=product_id,
@@ -1464,10 +1742,11 @@ def publish_files(
         task_id=task_id,
         author=author,
         attrib=final_version_attrib,
-        data=version_data,
+        data=final_version_data,
         tags=version_tags,
         status=version_status,
     )
+    _create_dependency_links(project_name, version_id, scene_dependencies)
 
     filepaths, missing_paths = collect_paths(
         path_or_paths=path_or_paths,
@@ -1508,6 +1787,14 @@ def publish_files(
         final_representation_attrib.update(representation_attrib)
 
     final_representation_data = dict(representation_data or {})
+    # BMFX Browser storage badges use explicit metadata. Local availability is
+    # still verified from disk; Google Drive remains false until the studio
+    # sync tool confirms upload and updates this field.
+    final_representation_data.setdefault("bmfxLocalPublished", True)
+    final_representation_data.setdefault("googleDriveSynced", False)
+    final_representation_data.setdefault(
+        "bmfxResourceKind", _bmfx_kind(None, filepaths)
+    )
     supplied_context = final_representation_data.get("context") or {}
     representation_context.update(supplied_context)
     final_representation_data["context"] = representation_context
@@ -1552,11 +1839,18 @@ def publish_files(
         "product_id": product_id,
         "version": version_number,
         "version_id": version_id,
+        "version_data": final_version_data,
+        "scene_dependencies": scene_dependencies,
+        "package_uid": final_version_data["bmfxPackageId"],
+        "execution_uid": final_version_data["bmfxExecutionId"],
         "representation_name": representation_name,
         "representation_id": representation_id,
         "frame_start": frame_start,
         "frame_end": frame_end,
         "files": filepaths,
+        "resource_representation_ids": {
+            representation_name: representation_id,
+        },
     }
 
 
@@ -1585,6 +1879,8 @@ def publish_review_sequence(
     burnin_preset=None,
     raise_on_upload_error=True,
     allow_version_fallback=False,
+    source_path=None,
+    scene_dependencies=None,
 ):
     merged_representation_data = {"preview": True}
     if representation_data:
@@ -1610,7 +1906,23 @@ def publish_review_sequence(
         representation_tags=_merge_unique_tags(["review"], representation_tags),
         representation_data=merged_representation_data,
         representation_attrib=representation_attrib,
+        scene_dependencies=scene_dependencies,
     )
+
+    # A flipbook is one package: image sequence, source scene, review movie,
+    # and thumbnail all share the same AYON version and BMFX package UID.
+    if source_path:
+        _register_result_representation(
+            result,
+            source_path,
+            representation_name="source",
+            representation_data={
+                "role": "sourceScene",
+                "application": "houdini",
+            },
+            representation_tags=["source", "workfile"],
+        )
+    _attach_result_thumbnail(result)
 
     if not create_online_reviewable:
         result["online_reviewable_file"] = None

@@ -232,6 +232,66 @@ def _path_is_below_any_target(path, target_paths):
     return False
 
 
+def _instance_root_paths_below_targets(stage, target_paths):
+    """Return concrete native USD instance roots below selected targets.
+
+    Render-pass collections commonly target an asset Xform and use
+    ``expandPrims`` for its contents.  Some Hydra delegates do not reliably
+    apply that inherited membership to native instance proxies, while they do
+    honor membership authored directly on the instance root.  Normal stage
+    traversal visits those roots (but intentionally does not enter their
+    proxies), so add the concrete roots without trying to target illegal
+    instance-proxy paths.
+    """
+    target_paths = _as_path_list(target_paths, "Instance Target")
+    if not target_paths:
+        return []
+
+    result = []
+    for prim in stage.Traverse():
+        if not prim.IsInstance():
+            continue
+        path = prim.GetPath().pathString
+        if _path_is_below_any_target(path, target_paths):
+            result.append(path)
+    return result
+
+
+def _deinstance_native_instances_for_render_pass(stage):
+    """Author local ``instanceable = false`` opinions for native instances.
+
+    OpenUSD render-pass visibility currently does not work for native USD
+    instances in Storm or RenderMan (OpenUSD issue #4122). Targeting instance
+    roots and instance proxies in the collections does not fix the Hydra
+    scene-index behavior. De-instancing at this downstream render-pass node is
+    the supported working form and leaves referenced/published source layers
+    untouched.
+
+    Repeat because de-instancing an outer instance can reveal nested native
+    instance roots which were not present in normal stage traversal before.
+    """
+    authored = []
+    authored_set = set()
+    while True:
+        paths = [
+            prim.GetPath().pathString
+            for prim in stage.Traverse()
+            if prim.IsInstance()
+            and prim.GetPath().pathString not in authored_set
+        ]
+        if not paths:
+            break
+        for path in paths:
+            prim = stage.GetPrimAtPath(path)
+            if not prim or not prim.SetInstanceable(False):
+                raise RuntimeError(
+                    "Cannot de-instance native USD prim for RenderPass: {}".format(path)
+                )
+            authored.append(path)
+            authored_set.add(path)
+    return authored
+
+
 def _layer_pass_names(pass_range, count):
     """Expand ``L200-L290`` to L200, L210, ... for ``count`` layers."""
     value = (pass_range or "").strip()
@@ -300,14 +360,18 @@ def _unassigned_renderable_paths(stage, assigned_paths):
     An unselected asset can own materials or other dependencies used by an
     assigned FX prim, and excluding the asset root would remove those too.
     ``UsdGeom.Boundable`` covers meshes, curves, volumes, point instancers, and
-    renderer procedural geometry while lights are handled separately.
+    renderer procedural geometry while lights are handled separately. Native
+    USD instance roots must be handled explicitly: they are usually Xforms,
+    and normal traversal does not descend into their boundable proxies.
     """
     from pxr import UsdGeom, UsdLux
 
     assigned_paths = _as_path_list(assigned_paths, "Render Target")
     result = []
     for prim in stage.Traverse():
-        if prim.HasAPI(UsdLux.LightAPI) or not prim.IsA(UsdGeom.Boundable):
+        if prim.HasAPI(UsdLux.LightAPI):
+            continue
+        if not prim.IsInstance() and not prim.IsA(UsdGeom.Boundable):
             continue
         path = prim.GetPath().pathString
         if not _path_is_below_any_target(path, assigned_paths):
@@ -372,11 +436,17 @@ def create_render_pass(stage, pass_name, beauty_paths, exclude_paths=(), phantom
     if not beauty_paths:
         return None
 
+    deinstanced_paths = _deinstance_native_instances_for_render_pass(stage)
+
     pass_schema = _define_render_pass(stage, pass_path)
     pass_prim = pass_schema.GetPrim()
     pass_prim.SetCustomDataByKey("ayon:configureRenderPass", True)
     pass_prim.SetCustomDataByKey("ayon:renderer", renderer)
     pass_prim.SetCustomDataByKey("ayon:renderPreset", preset)
+    pass_prim.SetCustomDataByKey(
+        "ayon:deinstancedNativeInstanceCount",
+        len(deinstanced_paths),
+    )
     pass_prim.SetCustomDataByKey(
         "ayon:renderDepartment", pass_department(pass_name)
     )
@@ -417,7 +487,9 @@ def create_render_pass(stage, pass_name, beauty_paths, exclude_paths=(), phantom
     # geometry.  This preserves material libraries and asset ancestors even
     # when an FX prim binds to a material owned by another department's asset.
     render_excludes = _as_path_list(
-        geometry_excludes + exclude_paths + light_excludes,
+        geometry_excludes
+        + exclude_paths
+        + light_excludes,
         "Render Exclude",
     )
     _author_collection(
@@ -437,7 +509,10 @@ def create_render_pass(stage, pass_name, beauty_paths, exclude_paths=(), phantom
         pass_schema,
         "camera",
         (),
-        geometry_excludes + phantom_excludes + exclude_paths + light_excludes,
+        geometry_excludes
+        + phantom_excludes
+        + exclude_paths
+        + light_excludes,
         include_root=True,
     )
     _author_collection(pass_schema, "prune", render_excludes, ())
